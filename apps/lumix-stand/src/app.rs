@@ -515,7 +515,8 @@ fn status_line(ui: &mut Ui, status: Option<&Status>) {
     if let Some(h) = s.hint() {
         ui.add_space(4.0);
         wrapped(ui, h, WARN);
-    } else if let Some(e) = &snap.last_error {
+    }
+    if let Some(e) = &snap.last_error {
         ui.add_space(4.0);
         wrapped(ui, e.clone(), DIM);
     }
