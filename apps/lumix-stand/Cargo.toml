@@ -1,0 +1,12 @@
+[package]
+name = "lumix-stand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Live view and capture for a Panasonic Lumix used as a fixed animation-stand camera"
+
+[lints]
+workspace = true
+
+[dependencies]
+lumix-link = { workspace = true }

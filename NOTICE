@@ -1,0 +1,10 @@
+lumix-stand
+Licensed under either of the Apache License, Version 2.0 (LICENSE-APACHE) or the MIT license
+(LICENSE-MIT), at your option.
+
+crates/lumix (lumix-link) was first written for Picabia (https://github.com/profdl/picabia-vector),
+a fork of VectorCraft, under the same MIT OR Apache-2.0 licence, and moved here on 2026-11-07.
+
+The camera protocol comes from public community notes about Panasonic's Wi-Fi remote control and
+from probing the owner's own camera. Panasonic doesn't document it, and nothing of Panasonic's
+(apps, firmware, artwork) is included.

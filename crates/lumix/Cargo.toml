@@ -1,0 +1,11 @@
+[package]
+name = "lumix-link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A Panasonic Lumix camera's Wi-Fi remote control (cam.cgi commands, UDP live view, keep-alive, reconnect) as a sans-IO controller, a transport trait, a simulated camera, SSDP discovery and a native std::net transport"
+
+[lints]
+workspace = true
+
+# No dependencies: HTTP, UDP and SSDP are std::net (native only), replies are read by hand.

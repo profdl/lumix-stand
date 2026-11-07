@@ -1,0 +1,6 @@
+/target
+.DS_Store
+# Captured frames and probe output never go in the repo.
+*.jpg
+*.JPG
+probe.log
