@@ -15,6 +15,8 @@ animation-stand camera. Moved out of Picabia (`../vectorcraft/picabia-vector`, P
   `app` (`Stand`: state and actions, tested headless against `sim`; `StandApp`: the window).
   `cargo run -p lumix-stand -- --connect sim` tries it without a camera; `--settings FILE`,
   `--capture-at SECS` and `--screenshot FILE.png` are for checking the window.
+  `cargo run -p lumix-stand --example bundle -- --install` builds `Lumix Stand.app` (icon drawn in
+  `examples/bundle.rs`, `Info.plist` with the Local Network usage text) and copies it to /Applications.
 - `docs/gx85.md`: the measured protocol, and the network setup that works.
 
 ## Rules
