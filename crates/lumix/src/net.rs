@@ -14,6 +14,9 @@ use crate::transport::{HttpReply, Originals, Transport};
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Waiting for its answer.
 pub const READ_TIMEOUT: Duration = Duration::from_millis(3000);
+/// The longest a download may go without a byte (the camera's file server can pause while the
+/// camera writes a new photo to the card).
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// The largest HTTP answer read (a device description; `cam.cgi` replies are far smaller).
 pub const MAX_HTTP: usize = 512 * 1024;
 
@@ -225,11 +228,16 @@ impl Originals for NetOriginals {
         let addr = SocketAddr::new(self.camera, self.port);
         download(addr, &self.camera.to_string(), &id.original_path(), photos::MAX_ORIGINAL, out, progress)
     }
+
+    fn preview(&mut self, id: PhotoId, out: &mut dyn Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Option<u64>, String> {
+        let addr = SocketAddr::new(self.camera, self.port);
+        download(addr, &self.camera.to_string(), &id.preview_path(), photos::MAX_PREVIEW, out, progress)
+    }
 }
 
 /// GET `path` from `addr` and write the body into `out` as it comes (at most `max` bytes).
-/// `Ok(None)`: 404. Each read waits at most [`READ_TIMEOUT`], so a stalled transfer fails rather
-/// than hangs. The GX85's file server (`KDM SERVER`, measured 2026-11-07) answers with a chunked
+/// `Ok(None)`: 404. The answer's start waits at most [`READ_TIMEOUT`] and each read of the body at
+/// most [`STALL_TIMEOUT`], so a stalled transfer fails rather than hangs. The GX85's file server (`KDM SERVER`, measured 2026-11-07) answers with a chunked
 /// body on a kept-alive connection and gives the size as `X-FILE_SIZE`; a `Content-Length` body
 /// is read too. A body shorter than its stated length is an error.
 pub fn download(
@@ -275,6 +283,7 @@ pub fn download(
     if stated.is_some_and(|l| l > max) {
         return Err(format!("the photo is larger than {} MiB", max / (1024 * 1024)));
     }
+    s.set_read_timeout(Some(STALL_TIMEOUT)).map_err(|e| e.to_string())?;
     let rest = head.get(end + 4..).unwrap_or_default().to_vec();
     let mut body = Body { r: std::io::BufReader::new(std::io::Cursor::new(rest).chain(s)), got: 0, max, stated, out, progress };
     body.progress();

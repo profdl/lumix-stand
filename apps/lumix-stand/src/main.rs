@@ -1,15 +1,19 @@
 //! Lumix Stand: live view and capture for a Panasonic Lumix used as a fixed animation-stand camera.
 //!
 //! ```text
-//! lumix-stand [--connect ADDRESS] [--settings FILE] [--capture-at SECS] [--screenshot FILE.png [--screenshot-at SECS]]
+//! lumix-stand [--connect ADDRESS] [--settings FILE] [--capture-at SECS] [--test-at SECS] [--screenshot FILE.png [--screenshot-at SECS]]
 //! ```
 //! `--connect sim` connects to the simulated camera at start. `--settings` uses another settings
-//! file. `--capture-at` presses Capture once, and `--screenshot` saves the window as a PNG (at 3 s
+//! file. `--capture-at` presses Capture once, `--test-at` Test shot once, and `--screenshot` saves the window as a PNG (at 3 s
 //! unless `--screenshot-at`) and quits: both are for checking the window.
 #![forbid(unsafe_code)]
 
 mod app;
+mod claude;
+mod exposure;
 mod frames;
+mod presets;
+mod review;
 mod settings;
 mod worker;
 
@@ -18,13 +22,15 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-const USAGE: &str = "usage: lumix-stand [--connect ADDRESS] [--settings FILE] [--capture-at SECS] [--screenshot FILE.png [--screenshot-at SECS]]";
+const USAGE: &str =
+    "usage: lumix-stand [--connect ADDRESS] [--settings FILE] [--capture-at SECS] [--test-at SECS] [--screenshot FILE.png [--screenshot-at SECS]]";
 
 #[derive(Debug, Default)]
 struct Args {
     connect: Option<String>,
     settings: Option<PathBuf>,
     capture_at: Option<f64>,
+    test_at: Option<f64>,
     screenshot: Option<PathBuf>,
     screenshot_at: Option<f64>,
 }
@@ -39,6 +45,7 @@ fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--connect" => a.connect = Some(it.next().ok_or("--connect needs an address")?),
             "--settings" => a.settings = Some(it.next().ok_or("--settings needs a file")?.into()),
             "--capture-at" => a.capture_at = Some(secs(it.next(), "--capture-at")?),
+            "--test-at" => a.test_at = Some(secs(it.next(), "--test-at")?),
             "--screenshot" => a.screenshot = Some(it.next().ok_or("--screenshot needs a file")?.into()),
             "--screenshot-at" => a.screenshot_at = Some(secs(it.next(), "--screenshot-at")?),
             "-h" | "--help" => return Err(String::new()),
@@ -65,14 +72,14 @@ fn main() -> std::process::ExitCode {
         viewport: egui::ViewportBuilder::default().with_title("Lumix Stand").with_inner_size([1120.0, 640.0]).with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
-    let script = app::Script::new(args.capture_at, args.screenshot.map(|p| (p, args.screenshot_at.unwrap_or(3.0))));
+    let script = app::Script::new(args.capture_at, args.test_at, args.screenshot.map(|p| (p, args.screenshot_at.unwrap_or(3.0))));
     let r = eframe::run_native(
         "Lumix Stand",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::Theme::Dark);
             let ctx = cc.egui_ctx.clone();
-            let picker: app::Picker = Box::new(|| rfd::FileDialog::new().set_title("Choose the capture folder").pick_folder());
+            let picker: app::Picker = Box::new(|title: &str| rfd::FileDialog::new().set_title(title).pick_folder());
             let mut stand = app::Stand::new(loaded, settings_path, picker, Arc::new(move || ctx.request_repaint()));
             stand.last = problem.map(|p| (false, p));
             if let Some(address) = args.connect {
@@ -101,9 +108,9 @@ mod tests {
 
     #[test]
     fn arguments() {
-        let a = args("--connect sim --screenshot /tmp/x.png --screenshot-at 4 --capture-at 2").unwrap();
+        let a = args("--connect sim --screenshot /tmp/x.png --screenshot-at 4 --capture-at 2 --test-at 1").unwrap();
         assert_eq!(a.connect.as_deref(), Some("sim"));
-        assert_eq!((a.capture_at, a.screenshot_at), (Some(2.0), Some(4.0)));
+        assert_eq!((a.capture_at, a.test_at, a.screenshot_at), (Some(2.0), Some(1.0), Some(4.0)));
         assert!(args("--connect").is_err());
         assert!(args("--capture-at soon").is_err());
         assert!(args("--wat").is_err());

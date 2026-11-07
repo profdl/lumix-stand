@@ -23,6 +23,19 @@ pub struct Settings {
     pub device_id: String,
     /// Save each capture's full-size photo from the camera's card (else the live-view frame).
     pub full_size: bool,
+    /// Pause live view while full-size photos download (faster downloads).
+    pub fast_downloads: bool,
+    /// The presets, in the order shown.
+    pub presets: Vec<crate::presets::Preset>,
+    /// The first preset has been made from the camera's settings (so deleting every preset
+    /// doesn't bring it back).
+    pub presets_seeded: bool,
+    /// The Claude model asked about test shots.
+    pub claude_model: String,
+    /// The 1Password reference of the Anthropic API key (`op://…`; empty: `ANTHROPIC_API_KEY`).
+    pub claude_key: String,
+    /// Finding the best exposure ends with Claude checking the shot.
+    pub claude_check: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +46,12 @@ impl Default for Settings {
             prefix: String::new(),
             device_id: lumix_link::Options::default().device_id,
             full_size: true,
+            fast_downloads: false,
+            presets: Vec::new(),
+            presets_seeded: false,
+            claude_model: crate::claude::MODELS[0].0.to_string(),
+            claude_key: String::new(),
+            claude_check: false,
         }
     }
 }
@@ -90,6 +109,13 @@ impl Settings {
         if self.folder.as_ref().is_some_and(|f| f.as_os_str().is_empty()) {
             self.folder = None;
         }
+        crate::presets::tidy(&mut self.presets);
+        if !crate::claude::MODELS.iter().any(|m| m.0 == self.claude_model) {
+            self.claude_model = d.claude_model;
+        }
+        if self.claude_key.len() > 512 || !(self.claude_key.is_empty() || self.claude_key.starts_with("op://")) {
+            self.claude_key = String::new();
+        }
     }
 }
 
@@ -112,7 +138,20 @@ mod tests {
         let d = TempDir::new("settings");
         let path = d.0.join("sub").join("settings.json");
         assert_eq!(Settings::load(&path), (Settings::default(), None), "missing: defaults, quietly");
-        let s = Settings { address: "10.0.0.5".into(), folder: Some(d.0.clone()), prefix: "take".into(), device_id: "ID".into(), full_size: false };
+        let preset = crate::presets::Preset { name: "Dark".into(), camera: vec![("iso".into(), "200".into())], ..Default::default() };
+        let s = Settings {
+            address: "10.0.0.5".into(),
+            folder: Some(d.0.clone()),
+            prefix: "take".into(),
+            device_id: "ID".into(),
+            full_size: false,
+            fast_downloads: true,
+            presets: vec![preset],
+            presets_seeded: true,
+            claude_model: "claude-opus-5-5".into(),
+            claude_key: "op://Private/Anthropic/credential".into(),
+            claude_check: true,
+        };
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path).0, s);
 

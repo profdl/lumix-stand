@@ -8,8 +8,11 @@
 //! each repaint ([`Worker::capture_outcome`]). Closing sends a last best-effort `stopstream`.
 //!
 //! Full-size photos come from a second thread with its own connection ([`Originals`]): a
-//! download takes 10-20 s on the camera's Wi-Fi, and live view and the keep-alive must go on
-//! meanwhile. A capture's photo is the one the controller expects ([`Controller::capture_photo`]);
+//! download takes 10-35 s on the camera's Wi-Fi, and live view and the keep-alive must go on
+//! meanwhile. Test shots' previews come from a third, so a test shot never waits behind a
+//! full-size download (*hypothesis*: the camera's file server serves two connections at once; a
+//! preview that fails then says so). With fast downloads on, live view pauses while full-size
+//! photos are downloading or waiting to, and comes back after. A capture's photo is the one the controller expects ([`Controller::capture_photo`]);
 //! when that isn't known, or isn't on the card within [`FIND_TIMEOUT`], the card is listed again
 //! once and the newest photo is taken.
 
@@ -28,8 +31,10 @@ use lumix_link::{CaptureOutcome, Controller, FocusStep, Options, Originals, Phas
 
 /// The simulated camera's address.
 pub const SIM_ADDRESS: &str = "sim";
-/// The widest and tallest frame decoded.
-const MAX_FRAME_SIDE: u32 = 4096;
+/// The widest and tallest frame decoded (the GX85's largest photo is 4592×3448).
+const MAX_FRAME_SIDE: u32 = 8192;
+/// Test-shot previews kept for the window.
+const MAX_PREVIEWS: usize = 16;
 /// The simulated camera's picture: the GX85's live-view size.
 const SIM_W: u32 = 640;
 const SIM_H: u32 = 360;
@@ -46,8 +51,10 @@ const MAX_DOWNLOADS: usize = 32;
 /// What became of a full-size download.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Download {
-    /// Waiting for the photo's number (the card is being listed) or for its turn.
+    /// Waiting for the photo's number (the card is being listed).
     Waiting,
+    /// Waiting for its turn.
+    Queued(PhotoId),
     /// Looking for the photo on the card.
     Finding(PhotoId),
     Downloading {
@@ -99,6 +106,11 @@ enum Msg {
     Capture(u64),
     /// Download capture `ticket`'s photo to the path.
     Download(u64, PathBuf),
+    /// Fetch capture `ticket`'s preview.
+    Preview(u64),
+    /// Download a photo from the card to the path (`ticket` is new).
+    Card(u64, PhotoId, PathBuf, Arc<AtomicBool>),
+    FastDownloads(bool),
     Set(String, String),
     Focus(FocusStep),
     OneShotAf,
@@ -106,17 +118,40 @@ enum Msg {
     Close,
 }
 
-/// A job for the downloads thread.
+/// What a download is for.
+#[derive(Clone, Debug)]
+enum Kind {
+    /// A capture's photo, into the path: looked for until it is on the card.
+    Capture(PathBuf),
+    /// A photo already on the card, into the path; skipped once the flag is set.
+    Card(PathBuf, Arc<AtomicBool>),
+    /// A capture's preview, kept in memory: looked for until it is on the card.
+    Preview,
+}
+
+impl Kind {
+    /// Goes to the full-size thread.
+    fn full_size(&self) -> bool {
+        !matches!(self, Kind::Preview)
+    }
+
+    /// Looked for until it appears (a capture's photo takes 1-4 s to be on the card).
+    fn wait_for_it(&self) -> bool {
+        !matches!(self, Kind::Card(..))
+    }
+}
+
+/// A job for a downloads thread.
 struct Job {
     ticket: u64,
     photo: PhotoId,
-    path: PathBuf,
+    kind: Kind,
 }
 
 /// A download waiting for the card's listing.
 struct Waiting {
     ticket: u64,
-    path: PathBuf,
+    kind: Kind,
     /// The listing generation it waits to pass.
     after: u64,
 }
@@ -131,6 +166,16 @@ struct Shared {
     capture: Option<(u64, CaptureOutcome)>,
     /// Downloads by ticket, oldest first.
     downloads: Vec<(u64, Download)>,
+    /// Test-shot previews by ticket, oldest first.
+    previews: Vec<(u64, DecodedFrame)>,
+    /// The last capture's ticket and the photo it is expected to be on the card.
+    capture_photo: Option<(u64, PhotoId)>,
+    /// Full-size downloads under way or waiting their turn.
+    full_jobs: usize,
+    /// Live view is paused for them.
+    paused: bool,
+    /// Setting changes the link thread has taken and published the state of.
+    changes_taken: u64,
     /// The worker ended (why).
     ended: Option<String>,
 }
@@ -155,6 +200,11 @@ pub struct Status {
     pub snap: Snapshot,
     pub address: String,
     pub sim: bool,
+    /// Live view is paused while full-size photos download (fast downloads).
+    pub paused: bool,
+    /// Setting changes are on their way to the link thread (so the camera's pending commands
+    /// don't count them yet).
+    pub settling: bool,
     /// The worker ended (why).
     pub ended: Option<String>,
 }
@@ -204,6 +254,8 @@ pub struct Worker {
     address: String,
     sim: bool,
     tickets: u64,
+    /// Setting changes sent to the link thread.
+    changes_sent: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Worker {
@@ -220,31 +272,50 @@ impl Worker {
     /// Open the transport and start the worker; `address` is what the status shows. `repaint` is
     /// called when there is something new to show.
     pub fn start(target: Target, address: &str, device_id: &str, repaint: Arc<dyn Fn() + Send + Sync>) -> Result<Worker, String> {
-        let (transport, originals, sim): (Box<dyn Transport + Send>, Box<dyn Originals>, bool) = match target {
-            Target::Camera(addr) => (Box::new(NetTransport::open(addr, lumix_link::DEFAULT_UDP_PORT)?), Box::new(NetOriginals::new(addr)), false),
+        type Parts = (Box<dyn Transport + Send>, Box<dyn Originals>, Box<dyn Originals>, bool);
+        let (transport, originals, previews, sim): Parts = match target {
+            Target::Camera(addr) => (
+                Box::new(NetTransport::open(addr, lumix_link::DEFAULT_UDP_PORT)?),
+                Box::new(NetOriginals::new(addr)),
+                Box::new(NetOriginals::new(addr)),
+                false,
+            ),
             Target::Sim(opts) => {
                 let cam = SimCamera::new(opts);
-                (Box::new(cam.clone()), Box::new(cam), true)
+                (Box::new(cam.clone()), Box::new(cam.clone()), Box::new(cam), true)
             }
         };
         let opts = Options { udp_port: transport.udp_port(), device_id: device_id.to_string(), ..Options::default() };
         let (tx, rx) = channel();
         let (jobs_tx, jobs_rx) = channel::<Job>();
-        let (missed_tx, missed_rx) = channel::<(u64, PhotoId, PathBuf)>();
+        let (previews_tx, previews_rx) = channel::<Job>();
+        let (missed_tx, missed_rx) = channel::<Job>();
         let shared = Arc::new(Mutex::new(Shared::default()));
         let cancel = Arc::new(AtomicBool::new(false));
-        let (sh, c, r) = (shared.clone(), cancel.clone(), repaint.clone());
-        std::thread::Builder::new()
-            .name("lumix-originals".into())
-            .spawn(move || downloads(originals, &jobs_rx, &missed_tx, &sh, &c, r.as_ref()))
-            .map_err(|e| format!("can't start the downloads: {e}"))?;
+        for (name, o, rx) in [("lumix-originals", originals, jobs_rx), ("lumix-previews", previews, previews_rx)] {
+            let (sh, c, r, m) = (shared.clone(), cancel.clone(), repaint.clone(), missed_tx.clone());
+            std::thread::Builder::new()
+                .name(name.into())
+                .spawn(move || downloads(o, &rx, &m, &sh, &c, r.as_ref()))
+                .map_err(|e| format!("can't start the downloads: {e}"))?;
+        }
         let sh = shared.clone();
-        let link = Link { jobs: jobs_tx, missed: missed_rx, waiting: Vec::new(), retried: Vec::new() };
+        let link = Link {
+            jobs: jobs_tx,
+            previews: previews_tx,
+            missed: missed_rx,
+            waiting: Vec::new(),
+            retried: Vec::new(),
+            fast: false,
+            live_wanted: true,
+            paused: false,
+            changes_taken: 0,
+        };
         std::thread::Builder::new()
             .name("lumix-link".into())
             .spawn(move || run(Controller::new(opts), transport, link, &rx, &sh, repaint.as_ref()))
             .map_err(|e| format!("can't start the camera link: {e}"))?;
-        Ok(Worker { tx, shared, cancel, address: address.trim().to_string(), sim, tickets: 0 })
+        Ok(Worker { tx, shared, cancel, address: address.trim().to_string(), sim, tickets: 0, changes_sent: 0.into() })
     }
 
     /// End the worker and wait at most `wait` for its last `stopstream`. A download under way
@@ -284,6 +355,37 @@ impl Worker {
         self.tx.send(Msg::Download(ticket, path)).map_err(|_| self.gone())
     }
 
+    /// Fetch capture `ticket`'s preview; [`Worker::preview_frame`] has it once it came.
+    pub fn preview(&self, ticket: u64) -> Result<(), String> {
+        lock(&self.shared).put_download(ticket, Download::Waiting);
+        self.tx.send(Msg::Preview(ticket)).map_err(|_| self.gone())
+    }
+
+    /// Capture `ticket`'s preview, decoded (once its download is done).
+    pub fn preview_frame(&self, ticket: u64) -> Option<DecodedFrame> {
+        lock(&self.shared).previews.iter().find(|(t, _)| *t == ticket).map(|(_, f)| f.clone())
+    }
+
+    /// Download `photo` from the card to `path` (a new file: never replaced), unless `skip` is set
+    /// before its turn. Its ticket, for [`Worker::download_state`].
+    pub fn download_card(&mut self, photo: PhotoId, path: PathBuf, skip: Arc<AtomicBool>) -> Result<u64, String> {
+        self.tickets += 1;
+        lock(&self.shared).put_download(self.tickets, Download::Queued(photo));
+        self.tx.send(Msg::Card(self.tickets, photo, path, skip)).map_err(|_| self.gone())?;
+        Ok(self.tickets)
+    }
+
+    /// The photo capture `ticket` is expected to be on the card (known once the shutter fired and
+    /// the card was listed).
+    pub fn capture_photo(&self, ticket: u64) -> Option<PhotoId> {
+        lock(&self.shared).capture_photo.filter(|(t, _)| *t == ticket).map(|(_, p)| p)
+    }
+
+    /// Pause live view while full-size photos download (faster downloads).
+    pub fn fast_downloads(&self, on: bool) -> Result<(), String> {
+        self.tx.send(Msg::FastDownloads(on)).map_err(|_| self.gone())
+    }
+
     /// What became of capture `ticket`'s download (`None`: none was asked for, or it's long gone).
     pub fn download_state(&self, ticket: u64) -> Option<Download> {
         let sh = lock(&self.shared);
@@ -297,19 +399,23 @@ impl Worker {
 
     /// Change a camera setting (`key` from [`lumix_link::menu::catalogue`]).
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
+        self.changes_sent.fetch_add(1, Ordering::SeqCst);
         self.tx.send(Msg::Set(key.into(), value.into())).map_err(|_| self.gone())
     }
 
     pub fn focus(&self, step: FocusStep) -> Result<(), String> {
+        self.changes_sent.fetch_add(1, Ordering::SeqCst);
         self.tx.send(Msg::Focus(step)).map_err(|_| self.gone())
     }
 
     pub fn one_shot_af(&self) -> Result<(), String> {
+        self.changes_sent.fetch_add(1, Ordering::SeqCst);
         self.tx.send(Msg::OneShotAf).map_err(|_| self.gone())
     }
 
     /// Read every setting again.
     pub fn refresh(&self) -> Result<(), String> {
+        self.changes_sent.fetch_add(1, Ordering::SeqCst);
         self.tx.send(Msg::Refresh).map_err(|_| self.gone())
     }
 
@@ -329,7 +435,14 @@ impl Worker {
 
     pub fn status(&self) -> Status {
         let sh = lock(&self.shared);
-        Status { snap: sh.snap.clone(), address: self.address.clone(), sim: self.sim, ended: sh.ended.clone() }
+        Status {
+            snap: sh.snap.clone(),
+            address: self.address.clone(),
+            sim: self.sim,
+            paused: sh.paused,
+            settling: sh.changes_taken < self.changes_sent.load(Ordering::SeqCst),
+            ended: sh.ended.clone(),
+        }
     }
 
     fn gone(&self) -> String {
@@ -346,27 +459,41 @@ impl Drop for Worker {
 
 /// The link thread's side of the downloads.
 struct Link {
+    /// To the full-size thread.
     jobs: Sender<Job>,
-    /// Photos the downloads thread didn't find.
-    missed: Receiver<(u64, PhotoId, PathBuf)>,
+    /// To the previews thread.
+    previews: Sender<Job>,
+    /// Photos a downloads thread didn't find.
+    missed: Receiver<Job>,
     waiting: Vec<Waiting>,
     /// Downloads listed for a second time already.
     retried: Vec<u64>,
+    /// Pause live view while full-size photos download.
+    fast: bool,
+    /// Live view as the window asked for it.
+    live_wanted: bool,
+    /// Paused for downloads now.
+    paused: bool,
+    /// Setting changes taken (published after the state that has them queued).
+    changes_taken: u64,
 }
 
 impl Link {
     /// Hand on the downloads whose photo is known now; list the card again for those missed.
     fn follow_up(&mut self, ctl: &mut Controller, shared: &Mutex<Shared>, now: u64) {
-        while let Ok((ticket, photo, path)) = self.missed.try_recv() {
+        while let Ok(job) = self.missed.try_recv() {
             // Listed once more; a second miss is final.
-            if self.retried.contains(&ticket) {
-                lock(shared).put_download(ticket, Download::Failed(format!("{} wasn't on the card", photo.file_name())));
+            if self.retried.contains(&job.ticket) {
+                lock(shared).put_download(job.ticket, Download::Failed(format!("{} wasn't on the card", job.photo.file_name())));
                 continue;
             }
-            self.retried.push(ticket);
+            self.retried.push(job.ticket);
+            if self.retried.len() > MAX_DOWNLOADS {
+                self.retried.remove(0);
+            }
             ctl.reindex_photos();
             let after = ctl.snapshot(now).photos.generation;
-            self.waiting.push(Waiting { ticket, path, after });
+            self.waiting.push(Waiting { ticket: job.ticket, kind: job.kind, after });
         }
         if self.waiting.is_empty() {
             return;
@@ -381,7 +508,7 @@ impl Link {
             // The newest photo is the capture's: after a miss it may have got another number, or
             // only have been slow to appear.
             match (photos.newest, &photos.error) {
-                (Some(p), _) => self.send(shared, w.ticket, p, w.path),
+                (Some(p), _) => self.send(shared, Job { ticket: w.ticket, photo: p, kind: w.kind }),
                 (None, Some(e)) => lock(shared).put_download(w.ticket, Download::Failed(format!("the photo wasn't found: {e}"))),
                 (None, None) => lock(shared).put_download(w.ticket, Download::Failed("the photo wasn't found on the card".into())),
             }
@@ -389,22 +516,67 @@ impl Link {
         self.waiting = still;
     }
 
-    fn send(&self, shared: &Mutex<Shared>, ticket: u64, photo: PhotoId, path: PathBuf) {
-        lock(shared).put_download(ticket, Download::Finding(photo));
-        if self.jobs.send(Job { ticket, photo, path }).is_err() {
-            lock(shared).put_download(ticket, Download::Failed("the downloads stopped".into()));
+    fn send(&self, shared: &Mutex<Shared>, job: Job) {
+        let ticket = job.ticket;
+        let full = job.kind.full_size();
+        {
+            let mut sh = lock(shared);
+            sh.put_download(ticket, Download::Queued(job.photo));
+            if full {
+                sh.full_jobs += 1;
+            }
+        }
+        let sent = if full { self.jobs.send(job) } else { self.previews.send(job) };
+        if sent.is_err() {
+            let mut sh = lock(shared);
+            sh.put_download(ticket, Download::Failed("the downloads stopped".into()));
+            if full {
+                sh.full_jobs = sh.full_jobs.saturating_sub(1);
+            }
         }
     }
 
-    /// A download asked for: send it on, or wait for a listing.
-    fn start(&mut self, ctl: &mut Controller, shared: &Mutex<Shared>, ticket: u64, path: PathBuf, photo: Option<PhotoId>, now: u64) {
+    /// A capture's download asked for: send it on, or wait for a listing.
+    fn start(&mut self, ctl: &mut Controller, shared: &Mutex<Shared>, ticket: u64, kind: Kind, photo: Option<PhotoId>, now: u64) {
         match photo {
-            Some(p) => self.send(shared, ticket, p, path),
+            Some(p) => self.send(shared, Job { ticket, photo: p, kind }),
             None => {
                 ctl.reindex_photos();
                 let after = ctl.snapshot(now).photos.generation;
-                self.waiting.push(Waiting { ticket, path, after });
+                self.waiting.push(Waiting { ticket, kind, after });
             }
+        }
+    }
+
+    /// Live view as the window wants it, paused while full-size photos download (fast downloads).
+    fn pace_live_view(&mut self, ctl: &mut Controller, shared: &Mutex<Shared>) {
+        let busy = lock(shared).full_jobs > 0;
+        let pause = self.fast && busy && self.live_wanted;
+        if pause && !self.paused {
+            self.paused = true;
+            ctl.stop_live_view();
+        } else if !pause && self.paused {
+            self.paused = false;
+            if self.live_wanted {
+                ctl.start_live_view();
+            }
+        }
+        lock(shared).paused = self.paused;
+    }
+
+    fn live_view(&mut self, ctl: &mut Controller, on: bool) {
+        self.live_wanted = on;
+        if self.paused {
+            // Back on (or not) once the downloads are done.
+            if !on {
+                self.paused = false;
+            }
+            return;
+        }
+        if on {
+            ctl.start_live_view();
+        } else {
+            ctl.stop_live_view();
         }
     }
 }
@@ -436,7 +608,11 @@ fn run(
             }
             pump(&mut ctl, t.as_mut(), &mut buf, 20, &now);
             link.follow_up(&mut ctl, shared, now());
-            if publish(&ctl, shared, &mut last_seq, capture.as_ref(), now()) {
+            link.pace_live_view(&mut ctl, shared);
+            let news = publish(&ctl, shared, &mut last_seq, capture.as_ref(), now());
+            // After the state with their commands queued, so a test shot never sees neither.
+            lock(shared).changes_taken = link.changes_taken;
+            if news {
                 repaint();
             }
         }
@@ -460,12 +636,12 @@ fn take_messages(
     loop {
         // A change asked for while not connected is dropped: the window greys the controls then.
         let refused = match rx.try_recv() {
-            Ok(Msg::LiveView(true)) => {
-                ctl.start_live_view();
+            Ok(Msg::LiveView(on)) => {
+                link.live_view(ctl, on);
                 Ok(())
             }
-            Ok(Msg::LiveView(false)) => {
-                ctl.stop_live_view();
+            Ok(Msg::FastDownloads(on)) => {
+                link.fast = on;
                 Ok(())
             }
             Ok(Msg::Capture(ticket)) => {
@@ -474,13 +650,32 @@ fn take_messages(
             }
             Ok(Msg::Download(ticket, path)) => {
                 let photo = capture.as_ref().filter(|(t, _)| *t == ticket).and_then(|(_, id)| id.as_ref().ok()).and_then(|id| ctl.capture_photo(*id));
-                link.start(ctl, shared, ticket, path, photo, now);
+                link.start(ctl, shared, ticket, Kind::Capture(path), photo, now);
                 Ok(())
             }
-            Ok(Msg::Set(k, v)) => ctl.set(&k, &v),
-            Ok(Msg::Focus(step)) => ctl.focus(step),
-            Ok(Msg::OneShotAf) => ctl.one_shot_af(),
+            Ok(Msg::Preview(ticket)) => {
+                let photo = capture.as_ref().filter(|(t, _)| *t == ticket).and_then(|(_, id)| id.as_ref().ok()).and_then(|id| ctl.capture_photo(*id));
+                link.start(ctl, shared, ticket, Kind::Preview, photo, now);
+                Ok(())
+            }
+            Ok(Msg::Card(ticket, photo, path, skip)) => {
+                link.send(shared, Job { ticket, photo, kind: Kind::Card(path, skip) });
+                Ok(())
+            }
+            Ok(Msg::Set(k, v)) => {
+                link.changes_taken += 1;
+                ctl.set(&k, &v)
+            }
+            Ok(Msg::Focus(step)) => {
+                link.changes_taken += 1;
+                ctl.focus(step)
+            }
+            Ok(Msg::OneShotAf) => {
+                link.changes_taken += 1;
+                ctl.one_shot_af()
+            }
             Ok(Msg::Refresh) => {
+                link.changes_taken += 1;
                 ctl.refresh_settings();
                 Ok(())
             }
@@ -491,12 +686,13 @@ fn take_messages(
     }
 }
 
-/// The downloads thread: each job's photo is looked for until it is on the card, then written
-/// to `<path>.part` and moved to `path` (never over an existing file).
+/// A downloads thread: each job's photo is looked for until it is on the card (a card photo
+/// only once), then written to `<path>.part` and moved to `path` (never over an existing file),
+/// or, for a preview, decoded and kept for the window.
 fn downloads(
     mut originals: Box<dyn Originals>,
     jobs: &Receiver<Job>,
-    missed: &Sender<(u64, PhotoId, PathBuf)>,
+    missed: &Sender<Job>,
     shared: &Mutex<Shared>,
     cancel: &AtomicBool,
     repaint: &(dyn Fn() + Send + Sync),
@@ -506,24 +702,40 @@ fn downloads(
             return;
         }
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fetch(originals.as_mut(), &job, shared, cancel, repaint)));
+        let full = job.kind.full_size();
         let state = match r {
             Ok(Ok(Some(bytes))) => Download::Done { photo: job.photo, bytes },
-            Ok(Ok(None)) => {
+            Ok(Ok(None)) if job.kind.wait_for_it() => {
                 // Not on the card where expected: the link lists the card and tries once more.
-                let _ = missed.send((job.ticket, job.photo, job.path.clone())); // the link may have ended: the status says so
-                lock(shared).put_download(job.ticket, Download::Waiting);
+                let (ticket, photo) = (job.ticket, job.photo);
+                let mut sh = lock(shared);
+                sh.put_download(ticket, Download::Waiting);
+                if full {
+                    sh.full_jobs = sh.full_jobs.saturating_sub(1);
+                }
+                drop(sh);
+                if missed.send(job).is_err() {
+                    lock(shared).put_download(ticket, Download::Failed(format!("{} wasn't on the card", photo.file_name())));
+                }
                 repaint();
                 continue;
             }
+            Ok(Ok(None)) => Download::Failed(format!("{} isn't on the card", job.photo.file_name())),
             Ok(Err(e)) => Download::Failed(e),
             Err(_) => Download::Failed("the download failed (internal error)".into()),
         };
-        lock(shared).put_download(job.ticket, state);
+        let mut sh = lock(shared);
+        sh.put_download(job.ticket, state);
+        if full {
+            sh.full_jobs = sh.full_jobs.saturating_sub(1);
+        }
+        drop(sh);
         repaint();
     }
 }
 
-/// Look for `job`'s photo for at most [`FIND_TIMEOUT`] and download it. `Ok(None)`: not found.
+/// Look for `job`'s photo (for at most [`FIND_TIMEOUT`] when it is a capture's) and download it.
+/// `Ok(None)`: not found.
 fn fetch(
     originals: &mut dyn Originals,
     job: &Job,
@@ -531,14 +743,21 @@ fn fetch(
     cancel: &AtomicBool,
     repaint: &(dyn Fn() + Send + Sync),
 ) -> Result<Option<u64>, String> {
-    let part = part_path(&job.path);
     let deadline = Instant::now() + FIND_TIMEOUT;
+    if let Kind::Card(path, skip) = &job.kind {
+        if skip.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Err(format!("{} is in the folder already", job.photo.file_name()));
+        }
+    }
+    lock(shared).put_download(job.ticket, Download::Finding(job.photo));
+    repaint();
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err("stopped".into());
         }
-        let file = new_part(&part)?;
-        let mut out = Cancellable { inner: std::io::BufWriter::new(file), cancel };
         let mut last_shown = Instant::now();
         let mut progress = |got: u64, total: Option<u64>| {
             if last_shown.elapsed() >= Duration::from_millis(200) {
@@ -547,31 +766,56 @@ fn fetch(
                 repaint();
             }
         };
-        let r = originals.original(job.photo, &mut out, &mut progress).and_then(|got| {
-            out.flush().map_err(|e| format!("can't write {}: {e}", part.display()))?;
-            Ok(got)
-        });
-        drop(out);
-        match r {
-            Ok(Some(bytes)) => {
-                let placed = place(&part, &job.path);
-                let _ = std::fs::remove_file(&part); // gone already once placed
-                return placed.map(|()| Some(bytes));
+        let r = match &job.kind {
+            Kind::Capture(path) | Kind::Card(path, _) => to_file(originals, job.photo, path, cancel, &mut progress),
+            Kind::Preview => {
+                let mut out = Cancellable { inner: Vec::new(), cancel };
+                originals.preview(job.photo, &mut out, &mut progress).and_then(|got| match got {
+                    None => Ok(None),
+                    Some(bytes) => {
+                        let f = decode(job.ticket, &out.inner).ok_or("the preview isn't a JPEG this app can read")?;
+                        let mut sh = lock(shared);
+                        sh.previews.push((job.ticket, f));
+                        if sh.previews.len() > MAX_PREVIEWS {
+                            sh.previews.remove(0);
+                        }
+                        Ok(Some(bytes))
+                    }
+                })
             }
-            Ok(None) if Instant::now() < deadline => {
+        };
+        match r {
+            Ok(None) if job.kind.wait_for_it() && Instant::now() < deadline => {
                 lock(shared).put_download(job.ticket, Download::Finding(job.photo));
                 std::thread::sleep(FIND_EVERY);
             }
-            Ok(None) => {
-                let _ = std::fs::remove_file(&part); // nothing worth keeping
-                return Ok(None);
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&part); // nothing worth keeping
-                return Err(e);
-            }
+            r => return r,
         }
     }
+}
+
+/// Photo `id`'s original into `path`, through `<path>.part`.
+fn to_file(
+    originals: &mut dyn Originals,
+    id: PhotoId,
+    path: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<Option<u64>, String> {
+    let part = part_path(path);
+    let file = new_part(&part)?;
+    let mut out = Cancellable { inner: std::io::BufWriter::new(file), cancel };
+    let r = originals.original(id, &mut out, progress).and_then(|got| {
+        out.flush().map_err(|e| format!("can't write {}: {e}", part.display()))?;
+        Ok(got)
+    });
+    drop(out);
+    let r = match r {
+        Ok(Some(bytes)) => place(&part, path).map(|()| Some(bytes)),
+        r => r,
+    };
+    let _ = std::fs::remove_file(&part); // gone already once placed, and nothing worth keeping otherwise
+    r
 }
 
 /// A fresh, empty `part`. A file (or link) left there is removed first, and the new one is
@@ -642,6 +886,11 @@ fn publish(ctl: &Controller, shared: &Mutex<Shared>, last_seq: &mut u64, capture
             Ok(id) => ctl.capture_outcome(*id).unwrap_or(CaptureOutcome::Pending),
             Err(e) => CaptureOutcome::Failed(e.clone()),
         };
+        if let Ok(id) = asked
+            && let Some(p) = ctl.capture_photo(*id)
+        {
+            sh.capture_photo = Some((*ticket, p));
+        }
         let new = Some((*ticket, outcome));
         changed |= sh.capture != new;
         sh.capture = new;
@@ -671,6 +920,7 @@ pub fn sim_options() -> SimOptions {
         real_time: true,
         frame: Arc::new(test_card),
         original: Arc::new(full_test_card),
+        preview: Arc::new(preview_test_card),
         ..SimOptions::default()
     }
 }
@@ -680,6 +930,12 @@ pub fn full_test_card(n: u64) -> Vec<u8> {
     card_jpeg(n, SIM_FULL_W, SIM_FULL_H, 85)
 }
 
+/// The simulated camera's preview of photo `n`, taken `ev` stops from a correct exposure: the
+/// test card at 640×360, brighter or darker (so automatic exposure can be tried on it).
+pub fn preview_test_card(n: u64, ev: f32) -> Vec<u8> {
+    card_jpeg_exposed(n, SIM_W, SIM_H, 80, ev)
+}
+
 /// The simulated camera's picture for frame `n`: a soft gradient with a bar that sweeps across,
 /// so live view visibly moves. Encoded as a real JPEG.
 pub fn test_card(n: u64) -> Vec<u8> {
@@ -687,6 +943,21 @@ pub fn test_card(n: u64) -> Vec<u8> {
 }
 
 fn card_jpeg(n: u64, w: u32, h: u32, quality: u8) -> Vec<u8> {
+    card_jpeg_exposed(n, w, h, quality, 0.0)
+}
+
+/// The test card `ev` stops brighter (in linear light, so it clips as a photo does).
+fn card_jpeg_exposed(n: u64, w: u32, h: u32, quality: u8, ev: f32) -> Vec<u8> {
+    let gain = 2f32.powf(ev.clamp(-8.0, 8.0));
+    let lut: Vec<u8> = (0..=255u16)
+        .map(|v| {
+            let lin = (f32::from(v) / 255.0).powf(2.2) * gain;
+            (lin.min(1.0).powf(1.0 / 2.2) * 255.0).round() as u8
+        })
+        .collect();
+    let expose = |c: u8| lut.get(usize::from(c)).copied().unwrap_or(c);
+    // Live view (no exposure change) skips the table: it is drawn 15 times a second.
+    let exposed = ev.abs() > 0.001;
     let bar = u32::try_from(n.wrapping_mul(8) * u64::from(w) / u64::from(SIM_W) % u64::from(w)).unwrap_or(0);
     let bar_w = 24 * w / SIM_W;
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
@@ -694,7 +965,11 @@ fn card_jpeg(n: u64, w: u32, h: u32, quality: u8) -> Vec<u8> {
         for x in 0..w {
             let on_bar = x >= bar && x < bar + bar_w;
             let px = if on_bar { [240, 90, 60] } else { [ramp(x, w), ramp(y, h), 150] };
-            rgb.extend(px);
+            if exposed {
+                rgb.extend(px.map(expose));
+            } else {
+                rgb.extend(px);
+            }
         }
     }
     let mut out = Vec::new();

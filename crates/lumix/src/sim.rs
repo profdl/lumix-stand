@@ -14,7 +14,7 @@
 //! as `n/256` (the aperture clamped to the lens), `getinfo` for the lens and the current menu
 //! (picture sizes of other aspect ratios disabled), and the focus steps and one-shot AF, which
 //! work only in MF. The card: each capture adds a photo, `playmode` stops live view, the DLNA
-//! `Browse` answers only in playback mode, and [`Originals`] serves each photo's original from
+//! `Browse` answers only in playback mode, and [`Originals`] serves each photo's original and preview from
 //! [`SimOptions::original_delay_ms`] after its capture.
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -25,6 +25,9 @@ use crate::transport::{HttpReply, Originals, Transport};
 
 /// Makes frame `n`'s JPEG (the default: a marker-only stand-in that no decoder reads).
 pub type FrameMaker = Arc<dyn Fn(u64) -> Vec<u8> + Send + Sync>;
+/// Makes the preview of the `n`th photo, taken `ev` stops brighter than a correct exposure
+/// ([`exposure_ev`]).
+pub type PreviewMaker = Arc<dyn Fn(u64, f32) -> Vec<u8> + Send + Sync>;
 /// The simulator's clock (ms).
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
@@ -47,10 +50,15 @@ pub struct SimOptions {
     pub frame: FrameMaker,
     /// Makes the original of the `n`th photo on the card (the default: a stand-in).
     pub original: FrameMaker,
+    /// Makes the preview of the `n`th photo on the card from its exposure (the default: a
+    /// stand-in).
+    pub preview: PreviewMaker,
     /// Photos on the card before the first capture.
     pub photos_on_card: u32,
     /// An original can be downloaded this long after its capture.
     pub original_delay_ms: u64,
+    /// Each original takes this long to download (only with [`SimOptions::real_time`]).
+    pub original_ms: u64,
     /// The DLNA `Browse` fails (HTTP 500), as it does in record mode on a GX85.
     pub refuse_browse: bool,
     /// The clock. The default is a clock at 0 that never moves; tests pass their own, the app a
@@ -72,8 +80,10 @@ impl Default for SimOptions {
             refuse_capture: false,
             frame: Arc::new(stand_in_jpeg),
             original: Arc::new(stand_in_jpeg),
+            preview: Arc::new(|n, _| stand_in_jpeg(n)),
             photos_on_card: 3,
             original_delay_ms: 500,
+            original_ms: 0,
             refuse_browse: false,
             clock: Arc::new(|| 0),
             real_time: false,
@@ -108,6 +118,7 @@ pub struct SimStats {
     pub requests: Vec<String>,
     pub browses: u32,
     pub downloads: u32,
+    pub previews: u32,
     pub handshakes: u32,
     pub captures: u32,
     pub start_streams: u32,
@@ -130,6 +141,8 @@ struct State {
     focus: u32,
     /// The card: each photo and when it was taken (ms).
     card: Vec<(PhotoId, u64)>,
+    /// Each photo's exposure ([`exposure_ev`]), by its place on the card.
+    exposures: Vec<f32>,
     stats: SimStats,
 }
 
@@ -137,6 +150,20 @@ struct State {
 pub const FIRST_PHOTO: PhotoId = PhotoId(1_000_001);
 /// The simulated lens: f/3.5-22 at this zoom (Av 3.6 to 9), 1/4000 s to 60 s, 12-32 mm.
 pub const SIM_LENS: &str = "ok,2304/256,927/256,3072/256,-1536/256,0,off,32,12,on,128/1024,on";
+
+/// How many stops brighter than a correct exposure (1/60 s, f/5.6, ISO 200) the settings give.
+/// Auto ISO is taken as correct, as the camera's metering would make it.
+pub fn exposure_ev(settings: &[(String, String)]) -> f32 {
+    let get = |k: &str| settings.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    if get("iso") == Some("auto") || get("iso") == Some("i_iso") {
+        return 0.0;
+    }
+    let apex = |k: &str, d: f32| get(k).and_then(crate::apex::parse).map_or(d, |v| v as f32 / 256.0);
+    let iso = get("iso").and_then(|v| v.parse::<f32>().ok()).filter(|i| *i > 0.0).unwrap_or(200.0);
+    let tv = apex("shtrspeed", 60f32.log2());
+    let av = apex("focal", 5.0);
+    (iso / 200.0).log2() - (tv - 60f32.log2()) - (av - 5.0)
+}
 
 /// The simulated camera's settings at first.
 fn first_settings() -> Vec<(String, String)> {
@@ -319,6 +346,10 @@ impl SimCamera {
                 let next = st.card.last().map_or(FIRST_PHOTO, |(p, _)| p.next());
                 if st.card.len() < 10_000 {
                     st.card.push((next, now));
+                    let ev = exposure_ev(&st.settings);
+                    let before = st.card.len() - 1;
+                    st.exposures.resize(before, 0.0);
+                    st.exposures.push(ev);
                 }
                 "ok"
             }
@@ -515,6 +546,23 @@ impl Transport for SimCamera {
 
 impl Originals for SimCamera {
     fn original(&mut self, id: PhotoId, out: &mut dyn std::io::Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Option<u64>, String> {
+        self.photo(id, false, out, progress)
+    }
+
+    fn preview(&mut self, id: PhotoId, out: &mut dyn std::io::Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Option<u64>, String> {
+        self.photo(id, true, out, progress)
+    }
+}
+
+impl SimCamera {
+    /// Photo `id`'s original or preview, once it is on the card.
+    fn photo(
+        &self,
+        id: PhotoId,
+        preview: bool,
+        out: &mut dyn std::io::Write,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<Option<u64>, String> {
         let opts = lock(&self.opts).clone();
         let now = (opts.clock)();
         if opts.offline {
@@ -523,10 +571,21 @@ impl Originals for SimCamera {
         let n = {
             let mut st = lock(&self.state);
             let Some(i) = st.card.iter().position(|(p, at)| *p == id && now >= at.saturating_add(opts.original_delay_ms)) else { return Ok(None) };
-            st.stats.downloads += 1;
+            if preview {
+                st.stats.previews += 1;
+            } else {
+                st.stats.downloads += 1;
+            }
             u64::try_from(i).unwrap_or(0) + 1
         };
-        let jpeg = (opts.original)(n);
+        if !preview && opts.real_time && opts.original_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(opts.original_ms.min(60_000)));
+        }
+        let ev = {
+            let st = lock(&self.state);
+            st.exposures.get(usize::try_from(n).unwrap_or(0).saturating_sub(1)).copied().unwrap_or(0.0)
+        };
+        let jpeg = if preview { (opts.preview)(n, ev) } else { (opts.original)(n) };
         let len = jpeg.len() as u64;
         out.write_all(&jpeg).map_err(|e| format!("can't write the photo: {e}"))?;
         progress(len, Some(len));

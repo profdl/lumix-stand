@@ -13,10 +13,29 @@ with Wi-Fi remote shooting may work, but haven't been tried.
 - **Live view** from the camera at up to 27 fps.
 - **Capture** with the button, Space or Enter. Frames go to a folder you choose as
   `frame_0001.jpg`, `frame_0002.jpg`, … (prefix of your choice). An existing file is never replaced.
-- **Full-size frames** downloaded from the camera's card in the background (about 10–20 s each over
+- **Full-size frames** downloaded from the camera's card in the background (about 10–35 s each over
   Wi-Fi) while you keep shooting. Each capture keeps its own number. If a download fails, the
   live-view frame is saved under that number, so the sequence has no gaps. Turn full size off to
-  save the 640×360 live-view frame at once.
+  save the 640×360 live-view frame at once. **Fast downloads** pauses live view while photos
+  download.
+- **Test shots** (button or T): fire the shutter and show the photo's preview from the card beside
+  live view, with a histogram, blinking clipping marks and the settings it was taken with. Test
+  shots collect in a strip, and each shows in colour how its settings differ from the one before.
+  Nothing is saved to the folder. **Last photo** shows the newest full-size capture instead; click
+  it to see it at 100%.
+- **Find the best exposure**, one button: ISO 200 (least grain), f/5.6 (sharpest on the kit
+  zoom), AF once in MF, then test shots, moving the shutter until the brightest tones sit just under
+  clipping. The camera must be in M.
+- **Ask Claude** about a test shot (optionally at the end of every search): it judges white
+  balance, colour casts, glare and uneven light, and suggests settings to apply. Choose Haiku 5.5
+  (about $0.0003 a question), Sonnet 5.5 or Opus 5.5. The API key is read from 1Password with its
+  CLI (`brew install 1password-cli`, then turn on Integrate with 1Password CLI in the 1Password
+  app) from a reference such as `op://Private/Anthropic/credential`, or from `ANTHROPIC_API_KEY`.
+- **Presets**: every camera setting plus the capture options, saved by name and applied with one
+  click. The camera's settings at the first connection become Preset 1, and a test shot's settings
+  can be saved as a preset.
+- **Download photos**: this session's captures, or a range of the camera's photo numbers, at full
+  size into a folder you pick, under the camera's names (an existing file is skipped).
 - **Camera settings** from the app: shutter speed, aperture, ISO, exposure compensation, white
   balance, metering, focus mode, AF area, peaking, aspect ratio, picture size, quality, photo style,
   filter, drive mode, flash and live-view size. Choices the camera won't take right now are greyed

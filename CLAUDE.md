@@ -16,10 +16,20 @@ animation-stand camera. Moved out of Picabia (`../vectorcraft/picabia-vector`, P
   periodic requests and lists the card at connect.
 - `apps/lumix-stand`: the eframe app. `worker` (the link's thread, frame decoding, and a second
   thread downloading full-size originals, so live view keeps going), `frames`
-  (numbered `<prefix>_<NNNN>.jpg`, never overwriting), `settings` (JSON in the OS config folder),
-  `app` (`Stand`: state and actions, tested headless against `sim`; `StandApp`: the window).
+  (numbered `<prefix>_<NNNN>.jpg`, never overwriting), `settings` (JSON in the OS config folder,
+  presets included), `presets`, `review` (histogram, clipping, reading a full-size photo),
+  `exposure` (the exposure worked out from a test shot: base ISO, f/5.6, the shutter that puts the
+  brightest channel's 99.5th percentile at 240), `claude` (asking Claude about a test shot over
+  raw HTTPS: the camera's allowed values as JSON-schema enums, the key from 1Password's `op read`
+  or `ANTHROPIC_API_KEY`; tests never touch the network), `app`
+  (`Stand`: state and actions, tested headless against `sim`; `StandApp`: the window;
+  `app/shots.rs`: test shots, the last photo, presets, card downloads; `app/assist.rs`: Find the
+  best exposure and Ask Claude; `app/panel.rs`: the side
+  panel; `app/compare.rs`: live view, the comparison and the test-shot strip).
+  The worker has three threads besides the window: the link, full-size downloads, and test-shot
+  previews (`DS…`, 640×360, made from the photo, so they show the real exposure).
   `cargo run -p lumix-stand -- --connect sim` tries it without a camera; `--settings FILE`,
-  `--capture-at SECS` and `--screenshot FILE.png` are for checking the window.
+  `--capture-at SECS`, `--test-at SECS` and `--screenshot FILE.png` are for checking the window.
   `cargo run -p lumix-stand --example bundle -- --install` builds `Lumix Stand.app` (icon drawn in
   `examples/bundle.rs`, `Info.plist` with the Local Network usage text) and copies it to /Applications.
 - `docs/gx85.md`: the measured protocol, and the network setup that works.
@@ -51,6 +61,10 @@ animation-stand camera. Moved out of Picabia (`../vectorcraft/picabia-vector`, P
   `MediaRenderer` (the phone app) and opens no ports until something answers. See `docs/gx85.md`.
 
 ## Next steps
+0. Check on the camera (not measured yet): a test shot's preview (`DS…`) arriving while a full-size
+   download runs on a second connection; how much faster a download is with live view stopped
+   (Fast downloads) than the measured 18 s with it on (10 s was in playback mode); whether the
+   file server pauses (the stall limit is now 20 s) while a new photo is written.
 1. Live view that shows the exposure: turn on Constant Preview on the camera (M mode) and measure
    again (docs/gx85.md ▸ Live view and the settings).
 2. Optional: send each capture to a running Picabia through its control port (`file.place` with

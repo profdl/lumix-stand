@@ -26,6 +26,8 @@ pub const BROWSE_ACTION: &str = "\"urn:schemas-upnp-org:service:ContentDirectory
 pub const FILE_PORT: u16 = 50001;
 /// The largest original downloaded (the GX85's are 3-10 MB).
 pub const MAX_ORIGINAL: u64 = 64 * 1024 * 1024;
+/// The largest preview downloaded (the GX85's 640×360 previews are well under 1 MB).
+pub const MAX_PREVIEW: u64 = 4 * 1024 * 1024;
 
 /// A photo on the card: its folder × 10000 + its number (`1230211`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -52,6 +54,12 @@ impl PhotoId {
     /// The original's path on [`FILE_PORT`].
     pub fn original_path(self) -> String {
         format!("/DO{:07}.JPG", self.0)
+    }
+
+    /// The 640×360 preview's path on [`FILE_PORT`] (made by the camera from the photo itself, so
+    /// it shows the real exposure, unlike live view).
+    pub fn preview_path(self) -> String {
+        format!("/DS{:07}.JPG", self.0)
     }
 
     /// The camera's own file name (`P1230211.JPG`).
@@ -124,6 +132,8 @@ mod tests {
         assert_eq!(p.original_path(), "/DO1230211.JPG");
         assert_eq!(p.file_name(), "P1230211.JPG");
         assert_eq!(p.next(), PhotoId(1_230_212));
+        assert_eq!(p.original_path(), "/DO1230211.JPG");
+        assert_eq!(p.preview_path(), "/DS1230211.JPG");
         assert_eq!(PhotoId(1_239_999).next(), PhotoId(1_240_001));
         assert!(PhotoId::parse("123021").is_none());
         assert!(PhotoId::parse("0990001").is_none(), "folders start at 100");

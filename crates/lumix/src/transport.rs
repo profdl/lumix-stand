@@ -76,6 +76,8 @@ pub trait Originals: Send {
     /// Write photo `id`'s original into `out`, telling `progress` (bytes so far, of how many when
     /// known). `Ok(None)`: the card has no such photo (yet); `Ok(Some(bytes))`: done.
     fn original(&mut self, id: PhotoId, out: &mut dyn std::io::Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Option<u64>, String>;
+    /// The same for photo `id`'s 640×360 preview (made from the photo, so it shows its exposure).
+    fn preview(&mut self, id: PhotoId, out: &mut dyn std::io::Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Option<u64>, String>;
 }
 
 /// One turn: send the controller's next request (if any) and hand it the answer, then hand it the
