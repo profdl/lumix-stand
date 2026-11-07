@@ -9,4 +9,10 @@ description = "Live view and capture for a Panasonic Lumix used as a fixed anima
 workspace = true
 
 [dependencies]
+dirs = "7.0.0"
+eframe = "0.37.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 lumix-link = { workspace = true }
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

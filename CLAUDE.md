@@ -10,7 +10,11 @@ animation-stand camera. Moved out of Picabia (`../vectorcraft/picabia-vector`, P
   (`cam.cgi` XML and the plain-text `accctrl` answer), `sim` (a simulated camera behind the same
   `Transport`), `ssdp`, `net` (std::net: HTTP GET, the UDP socket, discovery), and
   `examples/probe.rs`.
-- `apps/lumix-stand`: the app (a placeholder for now).
+- `apps/lumix-stand`: the eframe app. `worker` (the link's thread, frame decoding), `frames`
+  (numbered `<prefix>_<NNNN>.jpg`, never overwriting), `settings` (JSON in the OS config folder),
+  `app` (`Stand`: state and actions, tested headless against `sim`; `StandApp`: the window).
+  `cargo run -p lumix-stand -- --connect sim` tries it without a camera; `--settings FILE`,
+  `--capture-at SECS` and `--screenshot FILE.png` are for checking the window.
 - `docs/gx85.md`: the measured protocol, and the network setup that works.
 
 ## Rules
@@ -40,14 +44,8 @@ animation-stand camera. Moved out of Picabia (`../vectorcraft/picabia-vector`, P
   `MediaRenderer` (the phone app) and opens no ports until something answers. See `docs/gx85.md`.
 
 ## Next steps
-1. The app window (egui/eframe): live view, address and Connect, Find, folder picker, prefix,
-   next file name, Capture, Start/Stop live view, status line and hint. Port the worker thread and
-   window from Picabia: `crates/engine/src/cmd/picabia_camera/native.rs` (worker, frame decode,
-   capture wait), `crates/engine/src/cmd/picabia_camera.rs` (numbered files, folder and prefix
-   checks, `save_frame`), and `crates/ui-egui/src/picabia_camera_window.rs` (layout).
-2. Settings in a small JSON file in the OS config folder (address, folder, prefix, device id).
-3. A capture shortcut (Space or Enter in the window).
-4. Optional: send each capture to a running Picabia through its control port (`file.place` with
+1. Check the app with the real camera.
+2. Optional: send each capture to a running Picabia through its control port (`file.place` with
    `link: true`).
-5. Later: full-resolution download over DLNA (port 60606), lock focus and exposure (`setsetting`),
+3. Later: full-resolution download over DLNA (port 60606), lock focus and exposure (`setsetting`),
    and Via Network mode.
