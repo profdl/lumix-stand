@@ -21,11 +21,19 @@ pub struct Settings {
     /// Our id in the camera's access handshake. The camera knows this computer by it: changing it
     /// means accepting the computer on the camera again.
     pub device_id: String,
+    /// Save each capture's full-size photo from the camera's card (else the live-view frame).
+    pub full_size: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { address: lumix_link::DEFAULT_IP.into(), folder: None, prefix: String::new(), device_id: lumix_link::Options::default().device_id }
+        Settings {
+            address: lumix_link::DEFAULT_IP.into(),
+            folder: None,
+            prefix: String::new(),
+            device_id: lumix_link::Options::default().device_id,
+            full_size: true,
+        }
     }
 }
 
@@ -96,6 +104,7 @@ mod tests {
         assert_eq!(s.device_id, "4D454930-0100-1000-8000-PICABIA00001");
         assert_eq!(s.address, "192.168.54.1");
         assert_eq!(s.folder, None);
+        assert!(s.full_size);
     }
 
     #[test]
@@ -103,7 +112,7 @@ mod tests {
         let d = TempDir::new("settings");
         let path = d.0.join("sub").join("settings.json");
         assert_eq!(Settings::load(&path), (Settings::default(), None), "missing: defaults, quietly");
-        let s = Settings { address: "10.0.0.5".into(), folder: Some(d.0.clone()), prefix: "take".into(), device_id: "ID".into() };
+        let s = Settings { address: "10.0.0.5".into(), folder: Some(d.0.clone()), prefix: "take".into(), device_id: "ID".into(), full_size: false };
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path).0, s);
 

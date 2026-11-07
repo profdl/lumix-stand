@@ -2,8 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::frame::MAX_DATAGRAM;
+use crate::photos::PhotoId;
+use crate::sim::FIRST_PHOTO;
 use crate::sim::{SimCamera, SimOptions};
-use crate::{CaptureOutcome, Controller, Options, Phase, RequestKind, Transport, pump};
+use crate::{CaptureOutcome, Controller, FocusStep, Options, Originals, Phase, RequestKind, Transport, pump};
 
 /// A simulated camera on a clock the test moves, and a controller.
 struct Rig {
@@ -251,4 +253,162 @@ fn junk_replies_and_datagrams_are_survived() {
 #[test]
 fn query_values_are_encoded() {
     assert_eq!(crate::controller::query_value("Pic abia&x=1"), "Pic%20abia%26x%3D1");
+}
+
+#[test]
+fn setting_values_keep_slashes_and_colons() {
+    assert_eq!(crate::controller::setting_value("1622/256"), "1622/256");
+    assert_eq!(crate::controller::setting_value("-1/3"), "-1/3");
+    assert_eq!(crate::controller::setting_value("16:9"), "16:9");
+    assert_eq!(crate::controller::setting_value("a&b=c d"), "a%26b%3Dc%20d");
+}
+
+/// Connected and streaming, with the first reading of the settings done.
+fn connected(f: impl FnOnce(&mut SimOptions)) -> Rig {
+    let mut r = Rig::new(f);
+    r.ctl.connect(r.now());
+    r.run(1_500);
+    assert_eq!(r.ctl.phase(), Phase::Streaming);
+    r
+}
+
+#[test]
+fn reads_the_settings_lens_and_menu_at_connect() {
+    let r = connected(|_| {});
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!(s.commands_pending, 0, "{:?}", s.log);
+    let st = &s.settings;
+    assert_eq!(st.value("shtrspeed"), Some("1622/256"));
+    assert_eq!(st.value("iso"), Some("auto"));
+    assert_eq!(st.value("afmode"), Some("49area"), "from the menu: getsetting can't read it");
+    assert_eq!(st.lens.map(|l| l.av_wide), Some(927));
+    assert!(st.menu_read);
+    assert!(!st.enabled("pctsiz_16m"), "16:9 at first: no 16M");
+    assert!(st.enabled("pctsiz_12m"));
+    assert!(r.cam.stats().frames_sent > 5, "live view ran meanwhile");
+}
+
+#[test]
+fn sets_a_setting_and_reads_it_back() {
+    let mut r = connected(|_| {});
+    r.ctl.set("iso", "400").unwrap();
+    r.ctl.set("shtrspeed", &crate::apex::format(crate::apex::third(15))).unwrap();
+    r.run(300);
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!(s.settings.value("iso"), Some("400"));
+    assert_eq!(r.cam.setting("shtrspeed").as_deref(), Some("1280/256"));
+    assert_eq!(s.settings.value("shtrspeed"), Some("1280/256"));
+    assert!(r.cam.stats().requests.iter().any(|q| q == "/cam.cgi?mode=setsetting&type=shtrspeed&value=1280/256"));
+    assert_eq!(s.phase, Phase::Streaming, "live view kept going");
+
+    // The largest size: 4:3, then 16M, which the menu now allows.
+    r.ctl.set("aspectratio", "4:3").unwrap();
+    r.run(200);
+    assert!(r.ctl.snapshot(r.now()).settings.enabled("pctsiz_16m"));
+    r.ctl.set("pictsize", "16m").unwrap();
+    r.run(200);
+    assert_eq!(r.ctl.snapshot(r.now()).settings.value("pictsize"), Some("16m"));
+}
+
+#[test]
+fn a_refused_setting_is_kept_until_set_again() {
+    let mut r = connected(|_| {});
+    r.ctl.set("iso", "123").unwrap();
+    r.run(200);
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!(s.settings.refused, Some(("iso".into(), "123".into(), "err_param".into())));
+    assert_eq!(s.settings.value("iso"), Some("auto"), "unchanged");
+    r.ctl.set("iso", "200").unwrap();
+    r.run(200);
+    assert_eq!(r.ctl.snapshot(r.now()).settings.refused, None);
+}
+
+#[test]
+fn the_cameras_own_changes_are_noticed() {
+    let mut r = connected(|_| {});
+    r.cam.set_setting("whitebalance", "shade");
+    r.run(31_000);
+    assert_eq!(r.ctl.snapshot(r.now()).settings.value("whitebalance"), Some("shade"));
+    assert_eq!(r.ctl.phase(), Phase::Streaming);
+}
+
+#[test]
+fn focus_steps_only_in_mf() {
+    let mut r = connected(|_| {});
+    r.ctl.focus(FocusStep::Wide).unwrap();
+    r.run(100);
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!(s.settings.refused, Some(("focus".into(), "wide-normal".into(), "err_reject".into())));
+    r.ctl.set("focusmode", "mf").unwrap();
+    r.ctl.focus(FocusStep::Wide).unwrap();
+    r.ctl.focus(FocusStep::TeleFast).unwrap();
+    r.ctl.one_shot_af().unwrap();
+    r.run(300);
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!(s.settings.focus, Some((512 + 14 - 130, 1024)));
+    assert_eq!(s.settings.refused, None, "a step that worked clears the refusal");
+}
+
+#[test]
+fn lists_the_card_and_expects_each_capture_next() {
+    let mut r = connected(|_| {});
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!(s.photos.newest, Some(PhotoId(FIRST_PHOTO.0 + 2)), "three photos on the card");
+    assert_eq!((s.photos.total, s.photos.generation, s.photos.error.clone()), (3, 1, None));
+    assert!(!r.cam.in_play_mode());
+    let id = r.ctl.capture().unwrap();
+    assert_eq!(r.ctl.capture_photo(id), None, "pending");
+    r.run(30);
+    assert_eq!(r.ctl.capture_photo(id), Some(PhotoId(FIRST_PHOTO.0 + 3)));
+    assert_eq!(r.cam.card().last(), Some(&PhotoId(FIRST_PHOTO.0 + 3)), "the guess is the camera's number");
+    r.run(600);
+    let mut out = Vec::new();
+    let got = r.cam.clone().original(PhotoId(FIRST_PHOTO.0 + 3), &mut out, &mut |_, _| {}).unwrap();
+    assert_eq!(got, Some(out.len() as u64));
+}
+
+#[test]
+fn a_failed_listing_costs_only_the_listing() {
+    let mut r = connected(|o| o.refuse_browse = true);
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!(s.phase, Phase::Streaming);
+    assert!(s.photos.error.as_deref().is_some_and(|e| e.contains("HTTP 500")), "{:?}", s.photos);
+    assert_eq!(s.photos.newest, None);
+    let id = r.ctl.capture().unwrap();
+    r.run(30);
+    assert_eq!(r.ctl.capture_outcome(id), Some(CaptureOutcome::Done));
+    assert_eq!(r.ctl.capture_photo(id), None, "no guess without a listing");
+    r.cam.update(|o| o.refuse_browse = false);
+    r.ctl.reindex_photos();
+    r.run(1_000);
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!(s.photos.newest, Some(PhotoId(FIRST_PHOTO.0 + 3)));
+    assert_eq!(s.phase, Phase::Streaming, "live view came back");
+}
+
+#[test]
+fn a_capture_during_a_listing_waits_for_record_mode() {
+    let mut r = connected(|_| {});
+    r.ctl.reindex_photos();
+    r.run(10); // playmode sent
+    assert!(r.cam.in_play_mode());
+    let id = r.ctl.capture().unwrap();
+    r.run(500);
+    assert_eq!(r.ctl.capture_outcome(id), Some(CaptureOutcome::Done));
+    assert_eq!(r.cam.stats().captures, 1);
+    assert_eq!(r.ctl.capture_photo(id), Some(PhotoId(FIRST_PHOTO.0 + 3)));
+}
+
+#[test]
+fn an_empty_card_and_no_listing_at_all() {
+    let r = connected(|o| o.photos_on_card = 0);
+    let s = r.ctl.snapshot(r.now());
+    assert_eq!((s.photos.newest, s.photos.total, s.photos.error.clone()), (None, 0, None));
+
+    let mut r = Rig::new(|_| {});
+    r.ctl = Controller::new(Options { index_photos: false, ..Options::default() });
+    r.ctl.connect(r.now());
+    r.run(1_000);
+    assert_eq!(r.cam.stats().browses, 0);
+    assert_eq!(r.ctl.phase(), Phase::Streaming);
 }

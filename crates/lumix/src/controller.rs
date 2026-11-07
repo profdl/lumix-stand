@@ -16,12 +16,31 @@
 //! goes out every `keepalive_ms` and `startstream` again every `restream_ms` (5 s each); when no frame has come for `frame_timeout_ms`, `startstream` goes out at once
 //! and [`Snapshot::no_frames`] says so (the usual cause on macOS is a refused Local Network
 //! permission). Several unanswered requests in a row count as the camera gone.
+//!
+//! # Settings and focus
+//! [`Command`]s (read or change a setting, read the lens and the menu, step the focus) wait in
+//! their own queue and go out between the periodic requests, which come first when they are due.
+//! Each change is read back. Every `settings_every_ms` (and at connect) everything is read again,
+//! since the camera's own dials change things too. What is known is [`Snapshot::settings`].
+//!
+//! # The card
+//! With `index_photos`, connecting lists the card before record mode (`playmode`, two DLNA
+//! `Browse`s; see [`crate::photos`]), so the newest photo is known. Each capture is then expected to
+//! be the next number ([`Controller::capture_photo`]). [`Controller::reindex_photos`] lists the card
+//! again (live view pauses for about a second). A listing that fails costs only the listing.
 
 use std::collections::VecDeque;
 
+use std::sync::Arc;
+
+use crate::apex::Lens;
 use crate::frame::{Frame, extract_jpeg};
+use crate::photos::{self, PhotoId};
 use crate::reply::Reply;
-use crate::transport::{HttpReply, Request, RequestKind};
+use crate::transport::{HttpReply, Post, Request, RequestKind};
+
+/// Commands waiting at most.
+const MAX_COMMANDS: usize = 64;
 
 /// Log lines kept.
 pub const LOG_LINES: usize = 50;
@@ -46,6 +65,10 @@ pub struct Options {
     pub max_failures: u32,
     pub backoff_min_ms: u64,
     pub backoff_max_ms: u64,
+    /// Read every setting again this often while connected.
+    pub settings_every_ms: u64,
+    /// List the card at connect, so captures can be downloaded at full size.
+    pub index_photos: bool,
 }
 
 impl Default for Options {
@@ -61,6 +84,8 @@ impl Default for Options {
             max_failures: 3,
             backoff_min_ms: 1_000,
             backoff_max_ms: 30_000,
+            settings_every_ms: 30_000,
+            index_photos: true,
         }
     }
 }
@@ -106,6 +131,94 @@ pub enum CaptureOutcome {
     Failed(String),
 }
 
+/// A step of the focus (`camctrl&type=focus`). Measured on a GX85 in MF: each answers
+/// `ok,<position>,1024`; a normal step moves about 14, a fast one about 130, `Wide` raises the
+/// position and stops at the end of travel. In AF modes they answer `err_reject,0,0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusStep {
+    TeleFast,
+    Tele,
+    Wide,
+    WideFast,
+}
+
+impl FocusStep {
+    fn value(self) -> &'static str {
+        match self {
+            FocusStep::TeleFast => "tele-fast",
+            FocusStep::Tele => "tele-normal",
+            FocusStep::Wide => "wide-normal",
+            FocusStep::WideFast => "wide-fast",
+        }
+    }
+}
+
+/// Something asked of the camera besides streaming and capturing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// `getsetting`.
+    Get(String),
+    /// `setsetting` (type, value).
+    Set(String, String),
+    /// `getinfo&type=lens`.
+    Lens,
+    /// `getinfo&type=curmenu`.
+    Menu,
+    Focus(FocusStep),
+    /// `camcmd&value=oneshot_af`: focus once (measured: works in MF, refused in AF-S).
+    OneShotAf,
+}
+
+/// What is known of the camera's settings.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CameraSettings {
+    /// (type, value), as last read or set.
+    pub values: Vec<(String, String)>,
+    pub lens: Option<Lens>,
+    /// The menu ids (without `menu_item_id_`) the camera doesn't allow now, sorted.
+    pub disabled: Vec<String>,
+    /// The focus position and its range, from the last focus step.
+    pub focus: Option<(u32, u32)>,
+    /// The last refusal: (type, value, the camera's answer). Cleared when that type is set.
+    pub refused: Option<(String, String, String)>,
+    /// The menu has been read.
+    pub menu_read: bool,
+}
+
+impl CameraSettings {
+    pub fn value(&self, key: &str) -> Option<&str> {
+        self.values.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// The camera allows menu item `menu_id` now (or the menu hasn't been read).
+    pub fn enabled(&self, menu_id: &str) -> bool {
+        self.disabled.binary_search_by(|d| d.as_str().cmp(menu_id)).is_err()
+    }
+
+    fn put(&mut self, key: &str, value: String) {
+        if let Some((_, v)) = self.values.iter_mut().find(|(k, _)| k == key) {
+            *v = value;
+        } else if self.values.len() < 64 {
+            self.values.push((key.to_string(), value));
+        }
+    }
+}
+
+/// What is known of the card.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhotoIndex {
+    /// The newest photo (counting the captures since the listing).
+    pub newest: Option<PhotoId>,
+    /// Photos on the card at the last listing.
+    pub total: u32,
+    /// One more for each listing finished (or failed).
+    pub generation: u64,
+    /// Listing now.
+    pub listing: bool,
+    /// Why the last listing failed.
+    pub error: Option<String>,
+}
+
 /// The link's state, for status reports.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
@@ -132,6 +245,10 @@ pub struct Snapshot {
     pub retry_in_ms: Option<u64>,
     /// The camera's last `getstate` leaves (battery, mode, card…).
     pub state: Vec<(String, String)>,
+    pub settings: Arc<CameraSettings>,
+    /// Commands not answered yet.
+    pub commands_pending: usize,
+    pub photos: PhotoIndex,
     pub log: Vec<String>,
 }
 
@@ -166,9 +283,19 @@ pub struct Controller {
     last_error: Option<String>,
     state: Vec<(String, String)>,
     captures: u64,
-    capture: Option<(u64, CaptureOutcome)>,
+    /// The last capture: its number, outcome, and the photo it is expected to be.
+    capture: Option<(u64, CaptureOutcome, Option<PhotoId>)>,
+    /// A capture asked for while the camera is in playback mode: it goes after record mode.
+    capture_after_rec: bool,
     /// Closing: one best-effort `stopstream` still to go.
     closing: bool,
+    commands: VecDeque<Command>,
+    sent: Option<Command>,
+    settings: Arc<CameraSettings>,
+    settings_read_at: Option<u64>,
+    photos: PhotoIndex,
+    /// In playback mode, to list the card.
+    in_play: bool,
     log: VecDeque<String>,
 }
 
@@ -202,7 +329,14 @@ impl Controller {
             state: Vec::new(),
             captures: 0,
             capture: None,
+            capture_after_rec: false,
             closing: false,
+            commands: VecDeque::new(),
+            sent: None,
+            settings: Arc::new(CameraSettings::default()),
+            settings_read_at: None,
+            photos: PhotoIndex::default(),
+            in_play: false,
             log: VecDeque::new(),
         }
     }
@@ -229,6 +363,7 @@ impl Controller {
         self.retry_at = None;
         self.closing = was_ready;
         self.fail_capture("the camera was disconnected");
+        self.reset_extras();
         self.note("closed");
     }
 
@@ -256,19 +391,90 @@ impl Controller {
         if !self.phase.ready() {
             return Err(format!("the camera isn't connected ({})", self.phase.as_str()));
         }
-        if matches!(self.capture, Some((_, CaptureOutcome::Pending))) {
+        if matches!(self.capture, Some((_, CaptureOutcome::Pending, _))) {
             return Err("the last capture hasn't finished yet".into());
         }
         self.captures += 1;
-        self.capture = Some((self.captures, CaptureOutcome::Pending));
-        // A capture goes before everything else waiting.
-        self.queue.push_front(RequestKind::Capture);
+        self.capture = Some((self.captures, CaptureOutcome::Pending, None));
+        if self.in_play {
+            // Listing the card: the shutter waits for record mode.
+            self.capture_after_rec = true;
+        } else {
+            // A capture goes before everything else waiting.
+            self.queue.push_front(RequestKind::Capture);
+        }
         Ok(self.captures)
     }
 
     /// What became of capture `id`; `None`: not the last capture.
     pub fn capture_outcome(&self, id: u64) -> Option<CaptureOutcome> {
-        self.capture.as_ref().filter(|(n, _)| *n == id).map(|(_, o)| o.clone())
+        self.capture.as_ref().filter(|(n, _, _)| *n == id).map(|(_, o, _)| o.clone())
+    }
+
+    /// The photo capture `id` is expected to be on the card (the next number after the newest);
+    /// `None` while it is pending, or when the card's newest photo isn't known.
+    pub fn capture_photo(&self, id: u64) -> Option<PhotoId> {
+        self.capture.as_ref().filter(|(n, _, _)| *n == id).and_then(|(_, _, p)| *p)
+    }
+
+    /// Ask for `key` to be set to `value` (then read back, with the menu, whose choices may
+    /// change with it).
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if !self.phase.ready() {
+            return Err(format!("the camera isn't connected ({})", self.phase.as_str()));
+        }
+        let menu_only = crate::menu::find(key).is_some_and(|s| s.menu_only);
+        self.command(Command::Set(key.to_string(), value.to_string()));
+        if !menu_only {
+            self.command(Command::Get(key.to_string()));
+        }
+        self.command(Command::Menu);
+        if key == "focal" || key == "shtrspeed" {
+            self.command(Command::Lens);
+        }
+        Ok(())
+    }
+
+    /// Step the focus (MF only).
+    pub fn focus(&mut self, step: FocusStep) -> Result<(), String> {
+        if !self.phase.ready() {
+            return Err(format!("the camera isn't connected ({})", self.phase.as_str()));
+        }
+        self.command(Command::Focus(step));
+        Ok(())
+    }
+
+    /// Focus once (MF only).
+    pub fn one_shot_af(&mut self) -> Result<(), String> {
+        if !self.phase.ready() {
+            return Err(format!("the camera isn't connected ({})", self.phase.as_str()));
+        }
+        self.command(Command::OneShotAf);
+        Ok(())
+    }
+
+    /// Read every setting, the lens and the menu again.
+    pub fn refresh_settings(&mut self) {
+        self.command(Command::Lens);
+        self.command(Command::Menu);
+        for s in crate::menu::catalogue() {
+            if !s.menu_only {
+                self.command(Command::Get(s.key.to_string()));
+            }
+        }
+    }
+
+    /// List the card again (live view pauses for about a second).
+    pub fn reindex_photos(&mut self) {
+        if self.phase.ready() && !self.in_play && !self.queue.contains(&RequestKind::PlayMode) {
+            self.photos.listing = true;
+            self.push(RequestKind::PlayMode);
+        }
+    }
+
+    /// Whether the card is listed at connect.
+    pub fn set_index_photos(&mut self, on: bool) {
+        self.opts.index_photos = on;
     }
 
     /// The newest frame.
@@ -296,6 +502,9 @@ impl Controller {
             failures: self.failures,
             retry_in_ms: self.retry_at.map(|t| t.saturating_sub(now)),
             state: self.state.clone(),
+            settings: self.settings.clone(),
+            commands_pending: self.commands.len() + usize::from(self.sent.is_some()),
+            photos: self.photos.clone(),
             log: self.log.iter().cloned().collect(),
         }
     }
@@ -316,6 +525,15 @@ impl Controller {
         if self.queue.is_empty() {
             self.schedule(now);
         }
+        if self.queue.is_empty() && self.phase.ready() && !self.in_play {
+            let c = self.commands.pop_front()?;
+            let path = command_path(&c);
+            if !matches!(c, Command::Get(_) | Command::Menu | Command::Lens) {
+                self.note(&format!("> {path}"));
+            }
+            self.sent = Some(c);
+            return Some(Request { kind: RequestKind::Command, path, post: None });
+        }
         let kind = self.queue.pop_front()?;
         match kind {
             RequestKind::KeepAlive => self.last_keepalive = now,
@@ -327,9 +545,21 @@ impl Controller {
 
     /// The answer to a `kind` request.
     pub fn on_reply(&mut self, kind: RequestKind, reply: Result<HttpReply, String>, now: u64) {
+        if matches!(kind, RequestKind::BrowseCount | RequestKind::BrowseNewest) {
+            return self.on_browse(kind, reply);
+        }
         let reply = reply.and_then(|r| if r.status == 200 { Ok(r) } else { Err(format!("the camera answered HTTP {}", r.status)) });
         match reply {
-            Err(e) => self.on_failure(kind, e, now),
+            Err(e) => {
+                if kind == RequestKind::Command {
+                    self.sent = None;
+                }
+                self.on_failure(kind, e, now);
+            }
+            Ok(r) if kind == RequestKind::Command => {
+                self.failures = 0;
+                self.on_command(&r.body);
+            }
             Ok(r) => {
                 self.failures = 0;
                 let reply = Reply::parse(&r.body);
@@ -377,7 +607,21 @@ impl Controller {
         self.accept_since = None;
         self.handshake_tried = false;
         self.stream_since = now;
+        self.reset_extras();
         self.push(RequestKind::Probe);
+    }
+
+    /// Forget the commands and the listing under way (a new connection starts them again).
+    fn reset_extras(&mut self) {
+        self.commands.clear();
+        self.sent = None;
+        self.settings_read_at = None;
+        self.in_play = false;
+        self.photos.listing = false;
+        if self.capture_after_rec {
+            self.capture_after_rec = false;
+            self.fail_capture("the camera stopped answering");
+        }
     }
 
     /// Periodic requests while connected.
@@ -407,6 +651,11 @@ impl Controller {
         }
         if now.saturating_sub(self.last_keepalive) >= self.opts.keepalive_ms {
             self.push(RequestKind::KeepAlive);
+            return;
+        }
+        if self.commands.is_empty() && self.settings_read_at.is_none_or(|t| now.saturating_sub(t) >= self.opts.settings_every_ms) {
+            self.settings_read_at = Some(now);
+            self.refresh_settings();
         }
     }
 
@@ -455,12 +704,22 @@ impl Controller {
             RequestKind::StartStream => format!("/cam.cgi?mode=startstream&value={}", self.opts.udp_port),
             RequestKind::Capture => "/cam.cgi?mode=camcmd&value=capture".to_string(),
             RequestKind::StopStream => "/cam.cgi?mode=stopstream".to_string(),
+            RequestKind::PlayMode => "/cam.cgi?mode=camcmd&value=playmode".to_string(),
+            RequestKind::BrowseCount | RequestKind::BrowseNewest => photos::BROWSE_PATH.to_string(),
+            // Commands are sent from `poll`; this is only reached by mistake.
+            RequestKind::Command => "/cam.cgi?mode=getstate".to_string(),
         };
+        let post = match kind {
+            RequestKind::BrowseCount => Some(photos::browse_body(0, 1)),
+            RequestKind::BrowseNewest => Some(photos::browse_body(self.photos.total.saturating_sub(1), 1)),
+            _ => None,
+        }
+        .map(|body| Post { port: photos::DLNA_PORT, action: photos::BROWSE_ACTION.into(), body });
         // The keep-alive would fill the log; the rest is worth seeing.
         if kind != RequestKind::KeepAlive {
             self.note(&format!("> {path}"));
         }
-        Request { kind, path }
+        Request { kind, path, post }
     }
 
     fn on_failure(&mut self, kind: RequestKind, e: String, now: u64) {
@@ -485,6 +744,7 @@ impl Controller {
         self.note(&format!("no answer: trying again in {} s", self.backoff_ms / 1000));
         self.backoff_ms = (self.backoff_ms * 2).min(self.opts.backoff_max_ms);
         self.fail_capture("the camera stopped answering");
+        self.reset_extras();
     }
 
     fn on_answer(&mut self, kind: RequestKind, r: &Reply, now: u64) {
@@ -508,15 +768,36 @@ impl Controller {
                 }
                 self.state = r.fields.clone();
                 self.backoff_ms = self.opts.backoff_min_ms;
-                self.push(RequestKind::RecMode);
+                if self.opts.index_photos {
+                    self.photos.listing = true;
+                    self.push(RequestKind::PlayMode);
+                } else {
+                    self.push(RequestKind::RecMode);
+                }
             }
             RequestKind::Handshake => self.on_handshake(r, now),
             RequestKind::RecMode => {
                 self.refused(kind, r);
                 self.phase = Phase::Connected;
+                self.in_play = false;
                 self.last_keepalive = now;
+                if std::mem::take(&mut self.capture_after_rec) {
+                    self.queue.push_front(RequestKind::Capture);
+                }
                 if self.live_view {
                     self.push(RequestKind::StartStream);
+                }
+            }
+            RequestKind::PlayMode => {
+                if r.ok() {
+                    self.in_play = true;
+                    if self.phase == Phase::Streaming {
+                        // Playback mode ends live view; record mode brings it back.
+                        self.phase = Phase::Connected;
+                    }
+                    self.push(RequestKind::BrowseCount);
+                } else {
+                    self.index_done(Some(format!("playback mode was refused ({})", r.result.as_deref().unwrap_or("no result"))));
                 }
             }
             RequestKind::StartStream => self.on_start_stream(r, now),
@@ -526,7 +807,112 @@ impl Controller {
                 }
             }
             RequestKind::Capture => self.on_capture(r),
-            RequestKind::StopStream => {}
+            RequestKind::StopStream | RequestKind::Command | RequestKind::BrowseCount | RequestKind::BrowseNewest => {}
+        }
+    }
+
+    /// A `Browse` answered (or didn't): its failure costs only the listing.
+    fn on_browse(&mut self, kind: RequestKind, reply: Result<HttpReply, String>) {
+        if self.phase == Phase::Closed || self.phase == Phase::Lost {
+            return;
+        }
+        let listing = match &reply {
+            Ok(r) if r.status == 200 => photos::parse_browse(&r.body).ok_or_else(|| "the card's listing couldn't be read".to_string()),
+            Ok(r) => Err(format!("the card's listing failed (HTTP {})", r.status)),
+            Err(e) => Err(format!("the card's listing failed: {e}")),
+        };
+        self.note(&format!("< browse {}", listing.as_ref().map_or_else(|e| e.clone(), |l| format!("{} photos", l.total))));
+        match (kind, listing) {
+            (_, Err(e)) => self.index_done(Some(e)),
+            (RequestKind::BrowseCount, Ok(l)) if l.total > 0 => {
+                self.photos.total = l.total;
+                self.push(RequestKind::BrowseNewest);
+            }
+            (_, Ok(l)) => {
+                self.photos.total = l.total;
+                self.photos.newest = l.photos.last().copied();
+                self.index_done(None);
+            }
+        }
+    }
+
+    /// The listing is over: back to record mode.
+    fn index_done(&mut self, error: Option<String>) {
+        if error.is_some() {
+            self.photos.newest = None;
+        }
+        self.photos.error = error;
+        self.photos.listing = false;
+        self.photos.generation += 1;
+        self.push(RequestKind::RecMode);
+    }
+
+    fn on_command(&mut self, body: &[u8]) {
+        let Some(c) = self.sent.take() else { return };
+        let s = Arc::make_mut(&mut self.settings);
+        match c {
+            Command::Get(key) => {
+                if let Some(v) = crate::menu::setting_value(body, &key) {
+                    s.put(&key, v);
+                }
+            }
+            Command::Set(key, value) => {
+                let r = Reply::parse(body);
+                if r.ok() {
+                    s.put(&key, value);
+                    if s.refused.as_ref().is_some_and(|(k, _, _)| *k == key) {
+                        s.refused = None;
+                    }
+                } else {
+                    s.refused = Some((key, value, r.result.unwrap_or_else(|| "no answer".into())));
+                }
+            }
+            Command::Lens => {
+                if let Some(l) = Lens::parse(body) {
+                    s.lens = Some(l);
+                }
+            }
+            Command::Menu => {
+                let items = crate::menu::parse_curmenu(body);
+                if !items.is_empty() {
+                    let mut disabled: Vec<String> = items.iter().filter(|i| !i.enabled).map(|i| i.id.clone()).collect();
+                    disabled.sort_unstable();
+                    disabled.dedup();
+                    s.disabled = disabled;
+                    s.menu_read = true;
+                    for st in crate::menu::catalogue().into_iter().filter(|st| st.menu_only) {
+                        if let Some(v) = items.iter().find(|i| i.id == st.menu_id).and_then(|i| i.value.clone()) {
+                            s.put(st.key, v);
+                        }
+                    }
+                }
+            }
+            Command::Focus(step) => {
+                let text = String::from_utf8_lossy(body.get(..body.len().min(256)).unwrap_or_default()).to_string();
+                let f: Vec<&str> = text.trim().split(',').map(str::trim).collect();
+                let num = |i: usize| f.get(i).and_then(|v| v.parse::<u32>().ok());
+                match (f.first().copied(), num(1), num(2)) {
+                    (Some("ok"), Some(p), Some(m)) if m > 0 => {
+                        s.focus = Some((p.min(m), m));
+                        if s.refused.as_ref().is_some_and(|(k, _, _)| k == "focus") {
+                            s.refused = None;
+                        }
+                    }
+                    (r, _, _) => s.refused = Some(("focus".into(), step.value().into(), r.unwrap_or("no answer").to_string())),
+                }
+            }
+            Command::OneShotAf => {
+                let r = Reply::parse(body);
+                if !r.ok() {
+                    s.refused = Some(("oneshot_af".into(), String::new(), r.result.unwrap_or_else(|| "no answer".into())));
+                }
+            }
+        }
+    }
+
+    fn command(&mut self, c: Command) {
+        if !self.commands.contains(&c) && self.commands.len() < MAX_COMMANDS {
+            self.commands.push_back(c);
         }
     }
 
@@ -562,13 +948,18 @@ impl Controller {
     }
 
     fn on_capture(&mut self, r: &Reply) {
-        let outcome = if r.ok() {
-            CaptureOutcome::Done
+        let (outcome, photo) = if r.ok() {
+            let photo = self.photos.newest.map(PhotoId::next);
+            if photo.is_some() {
+                self.photos.newest = photo;
+            }
+            (CaptureOutcome::Done, photo)
         } else {
-            CaptureOutcome::Failed(format!("the camera refused the capture ({})", r.result.as_deref().unwrap_or("no result")))
+            (CaptureOutcome::Failed(format!("the camera refused the capture ({})", r.result.as_deref().unwrap_or("no result"))), None)
         };
-        if let Some((_, o)) = self.capture.as_mut() {
+        if let Some((_, o, p)) = self.capture.as_mut() {
             *o = outcome;
+            *p = photo;
         }
     }
 
@@ -580,7 +971,7 @@ impl Controller {
     }
 
     fn fail_capture(&mut self, why: &str) {
-        if let Some((_, o)) = self.capture.as_mut()
+        if let Some((_, o, _)) = self.capture.as_mut()
             && *o == CaptureOutcome::Pending
         {
             *o = CaptureOutcome::Failed(why.into());
@@ -614,7 +1005,35 @@ fn kind_name(k: RequestKind) -> &'static str {
         RequestKind::KeepAlive => "keep-alive",
         RequestKind::Capture => "capture",
         RequestKind::StopStream => "stopstream",
+        RequestKind::Command => "command",
+        RequestKind::PlayMode => "playmode",
+        RequestKind::BrowseCount | RequestKind::BrowseNewest => "browse",
     }
+}
+
+fn command_path(c: &Command) -> String {
+    match c {
+        Command::Get(k) => format!("/cam.cgi?mode=getsetting&type={}", setting_value(k)),
+        Command::Set(k, v) => format!("/cam.cgi?mode=setsetting&type={}&value={}", setting_value(k), setting_value(v)),
+        Command::Lens => "/cam.cgi?mode=getinfo&type=lens".into(),
+        Command::Menu => "/cam.cgi?mode=getinfo&type=curmenu".into(),
+        Command::Focus(s) => format!("/cam.cgi?mode=camctrl&type=focus&value={}", s.value()),
+        Command::OneShotAf => "/cam.cgi?mode=camcmd&value=oneshot_af".into(),
+    }
+}
+
+/// A setting's type or value for the query string. The camera takes `/` and `:` as they are
+/// (`1622/256`, `16:9`, `-1/3`); everything but letters, digits and `-._~/:` is percent-encoded.
+pub(crate) fn setting_value(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes().take(128) {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// `s` for a query string: letters, digits and `-._~` kept, everything else percent-encoded.

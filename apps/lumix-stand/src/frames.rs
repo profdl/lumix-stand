@@ -79,6 +79,13 @@ fn number_in(name: &str, lead: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// Write `jpeg` to `path`, which must not exist yet.
+pub fn save_new(path: &Path, jpeg: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+    f.write_all(jpeg).and_then(|()| f.sync_all()).map_err(|e| format!("can't write {}: {e}", path.display()))
+}
+
 /// Write `jpeg` as the next numbered frame in `folder`, without ever replacing a file: a name
 /// taken in the meantime moves on to the next number.
 pub fn save_frame(folder: &Path, prefix: &str, jpeg: &[u8]) -> Result<(PathBuf, u32), String> {

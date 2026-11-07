@@ -2,12 +2,13 @@
 //! a UDP socket, and SSDP discovery. Every call has a timeout, so a camera that is off or out of
 //! range gives an error, never a hang.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
+use crate::photos::{self, PhotoId};
 use crate::ssdp::{self, Found};
-use crate::transport::{HttpReply, Transport};
+use crate::transport::{HttpReply, Originals, Transport};
 
 /// Connecting to the camera's web server.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -52,6 +53,10 @@ impl Transport for NetTransport {
         http_get(SocketAddr::new(self.camera, self.http_port), &self.camera.to_string(), path)
     }
 
+    fn post(&mut self, port: u16, path: &str, action: &str, body: &str) -> Result<HttpReply, String> {
+        http_post(SocketAddr::new(self.camera, port), &format!("{}:{port}", self.camera), path, action, body)
+    }
+
     fn recv(&mut self, buf: &mut [u8], wait_ms: u64) -> Result<Option<usize>, String> {
         let wait = Duration::from_millis(wait_ms.clamp(1, 1000));
         self.udp.set_read_timeout(Some(wait)).map_err(|e| e.to_string())?;
@@ -71,11 +76,30 @@ impl Transport for NetTransport {
 
 /// GET `path` from `addr` (`host` for the Host header).
 pub fn http_get(addr: SocketAddr, host: &str, path: &str) -> Result<HttpReply, String> {
-    let mut s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| no_answer(addr, &e))?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Picabia\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    http_exchange(addr, req.as_bytes())
+}
+
+/// POST a SOAP `body` to `path` on `addr`, with `action` as the `SOAPACTION` header.
+pub fn http_post(addr: SocketAddr, host: &str, path: &str, action: &str, body: &str) -> Result<HttpReply, String> {
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Picabia\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nSOAPACTION: {action}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    http_exchange(addr, req.as_bytes())
+}
+
+fn connect(addr: SocketAddr) -> Result<TcpStream, String> {
+    let s = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| no_answer(addr, &e))?;
     s.set_read_timeout(Some(READ_TIMEOUT)).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(READ_TIMEOUT)).map_err(|e| e.to_string())?;
-    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Picabia\r\nAccept: */*\r\nConnection: close\r\n\r\n");
-    s.write_all(req.as_bytes()).map_err(|e| no_answer(addr, &e))?;
+    Ok(s)
+}
+
+/// Send `req` to `addr` and read the whole answer (at most [`MAX_HTTP`]).
+fn http_exchange(addr: SocketAddr, req: &[u8]) -> Result<HttpReply, String> {
+    let mut s = connect(addr)?;
+    s.write_all(req).map_err(|e| no_answer(addr, &e))?;
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
@@ -183,6 +207,168 @@ fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, String> {
     Err("too many chunks".into())
 }
 
+/// Downloads originals from the camera's file server ([`photos::FILE_PORT`]).
+#[derive(Clone, Debug)]
+pub struct NetOriginals {
+    pub camera: IpAddr,
+    pub port: u16,
+}
+
+impl NetOriginals {
+    pub fn new(camera: IpAddr) -> NetOriginals {
+        NetOriginals { camera, port: photos::FILE_PORT }
+    }
+}
+
+impl Originals for NetOriginals {
+    fn original(&mut self, id: PhotoId, out: &mut dyn Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Option<u64>, String> {
+        let addr = SocketAddr::new(self.camera, self.port);
+        download(addr, &self.camera.to_string(), &id.original_path(), photos::MAX_ORIGINAL, out, progress)
+    }
+}
+
+/// GET `path` from `addr` and write the body into `out` as it comes (at most `max` bytes).
+/// `Ok(None)`: 404. Each read waits at most [`READ_TIMEOUT`], so a stalled transfer fails rather
+/// than hangs. The GX85's file server (`KDM SERVER`, measured 2026-11-07) answers with a chunked
+/// body on a kept-alive connection and gives the size as `X-FILE_SIZE`; a `Content-Length` body
+/// is read too. A body shorter than its stated length is an error.
+pub fn download(
+    addr: SocketAddr,
+    host: &str,
+    path: &str,
+    max: u64,
+    out: &mut dyn Write,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<Option<u64>, String> {
+    let mut s = connect(addr)?;
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Picabia\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).map_err(|e| no_answer(addr, &e))?;
+    // The headers.
+    let mut head = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let end = loop {
+        let n = s.read(&mut chunk).map_err(|e| no_answer(addr, &e))?;
+        if n == 0 {
+            return Err("the camera closed the connection before answering".into());
+        }
+        head.extend(chunk.get(..n).unwrap_or_default());
+        if let Some(e) = header_end(&head) {
+            break e;
+        }
+        if head.len() > 16 * 1024 {
+            return Err("the camera's answer has no end of headers".into());
+        }
+    };
+    let text = String::from_utf8_lossy(head.get(..end).unwrap_or_default()).to_ascii_lowercase();
+    let status =
+        text.lines().next().filter(|l| l.starts_with("http/1.")).and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse::<u16>().ok());
+    match status {
+        Some(404) => return Ok(None),
+        Some(200) => {}
+        Some(c) => return Err(format!("the camera answered HTTP {c}")),
+        None => return Err("the answer isn't HTTP".into()),
+    }
+    let header = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)).map(|v| v.trim().to_string());
+    let chunked = header("transfer-encoding:").is_some_and(|v| v.contains("chunked"));
+    let length = header("content-length:").and_then(|v| v.parse::<u64>().ok()).filter(|_| !chunked);
+    let stated = length.or_else(|| header("x-file_size:").and_then(|v| v.parse::<u64>().ok()));
+    if stated.is_some_and(|l| l > max) {
+        return Err(format!("the photo is larger than {} MiB", max / (1024 * 1024)));
+    }
+    let rest = head.get(end + 4..).unwrap_or_default().to_vec();
+    let mut body = Body { r: std::io::BufReader::new(std::io::Cursor::new(rest).chain(s)), got: 0, max, stated, out, progress };
+    body.progress();
+    if chunked {
+        body.chunked()?
+    } else {
+        body.plain(length)?
+    }
+    if let Some(l) = stated
+        && body.got < l
+    {
+        return Err(format!("the download stopped at {} of {} KB", body.got / 1000, l / 1000));
+    }
+    Ok(Some(body.got))
+}
+
+/// A download's body, read as it comes.
+struct Body<'a, R> {
+    r: std::io::BufReader<R>,
+    got: u64,
+    max: u64,
+    stated: Option<u64>,
+    out: &'a mut dyn Write,
+    progress: &'a mut dyn FnMut(u64, Option<u64>),
+}
+
+impl<R: Read> Body<'_, R> {
+    fn progress(&mut self) {
+        (self.progress)(self.got, self.stated);
+    }
+
+    /// Up to `limit` bytes into `out` (`None`: to the end).
+    fn copy(&mut self, limit: Option<u64>) -> Result<u64, String> {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut copied = 0u64;
+        while limit.is_none_or(|l| copied < l) {
+            let want = limit.map_or(buf.len(), |l| usize::try_from(l - copied).unwrap_or(usize::MAX).min(buf.len()));
+            let n = match self.r.read(buf.get_mut(..want).unwrap_or_default()) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    return Err(format!("the download stalled after {} KB", self.got / 1000));
+                }
+                Err(e) => return Err(format!("the download broke off after {} KB: {e}", self.got / 1000)),
+            };
+            self.got += n as u64;
+            copied += n as u64;
+            if self.got > self.max {
+                return Err(format!("the photo is larger than {} MiB", self.max / (1024 * 1024)));
+            }
+            self.out.write_all(buf.get(..n).unwrap_or_default()).map_err(|e| format!("can't write the photo: {e}"))?;
+            self.progress();
+        }
+        Ok(copied)
+    }
+
+    fn plain(&mut self, length: Option<u64>) -> Result<(), String> {
+        self.copy(length).map(|_| ())
+    }
+
+    /// A chunked body: `<hex size>\r\n<bytes>\r\n` until a size of 0.
+    fn chunked(&mut self) -> Result<(), String> {
+        for _ in 0..1_000_000 {
+            let line = self.line()?;
+            let size =
+                u64::from_str_radix(line.split(';').next().unwrap_or_default().trim(), 16).map_err(|_| "a chunk size isn't hex".to_string())?;
+            if size == 0 {
+                return Ok(());
+            }
+            if self.got.saturating_add(size) > self.max {
+                return Err(format!("the photo is larger than {} MiB", self.max / (1024 * 1024)));
+            }
+            if self.copy(Some(size))? < size {
+                return Err(format!("the download stopped at {} KB, inside a chunk", self.got / 1000));
+            }
+            if !self.line()?.is_empty() {
+                return Err("a chunk is longer than it says".into());
+            }
+        }
+        Err("too many chunks".into())
+    }
+
+    /// One line (without its CRLF), at most 1 KiB.
+    fn line(&mut self) -> Result<String, String> {
+        let mut raw = Vec::new();
+        let n =
+            (&mut self.r).take(1024).read_until(b'\n', &mut raw).map_err(|e| format!("the download broke off after {} KB: {e}", self.got / 1000))?;
+        if n == 0 || raw.last() != Some(&b'\n') {
+            return Err(format!("the download stopped at {} KB", self.got / 1000));
+        }
+        Ok(String::from_utf8_lossy(&raw).trim_end_matches(['\r', '\n']).to_string())
+    }
+}
+
 /// Ask the network who is there (SSDP), listening for `timeout_ms` (200-10000).
 pub fn discover(timeout_ms: u64) -> Result<Vec<Found>, String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("can't open a UDP port: {e}"))?;
@@ -269,6 +455,101 @@ mod tests {
             }
         }
         assert_eq!(got, Some(crate::sim::stand_in_jpeg(1).len()));
+    }
+
+    /// A one-shot HTTP server on loopback answering `answer` to the first request.
+    fn serve_once(answer: Vec<u8>) -> (SocketAddr, std::thread::JoinHandle<String>) {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let (mut c, _) = server.accept().unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = c.read(&mut buf).unwrap();
+            c.write_all(&answer).unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        (addr, t)
+    }
+
+    #[test]
+    fn downloads_into_a_writer() {
+        let body: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        answer.extend(&body);
+        let (addr, t) = serve_once(answer);
+        let mut out = Vec::new();
+        let mut seen = Vec::new();
+        let got = download(addr, "cam", "/DO1230211.JPG", 1 << 20, &mut out, &mut |g, l| seen.push((g, l))).unwrap();
+        assert_eq!(got, Some(body.len() as u64));
+        assert_eq!(out, body);
+        assert_eq!(seen.last(), Some(&(body.len() as u64, Some(body.len() as u64))));
+        assert!(t.join().unwrap().starts_with("GET /DO1230211.JPG HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn downloads_a_chunked_body_as_the_camera_sends_it() {
+        let body: Vec<u8> = (0..150_000u32).map(|i| (i % 253) as u8).collect();
+        let mut answer = format!(
+            "HTTP/1.1 200 OK\r\nServer: KDM SERVER Version 0.1\r\nTransfer-Encoding: chunked\r\nContent-Type: image/jpeg\r\nX-FILE_SIZE: {}\r\nConnection: Keep-Alive\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        for part in body.chunks(40_000) {
+            answer.extend(format!("{:x}\r\n", part.len()).as_bytes());
+            answer.extend(part);
+            answer.extend(b"\r\n");
+        }
+        answer.extend(b"0\r\n\r\n");
+        // The server keeps the connection open: the end is the last chunk, not a close.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let t = std::thread::spawn(move || {
+            let (mut c, _) = server.accept().unwrap();
+            let mut buf = vec![0u8; 8192];
+            let _ = c.read(&mut buf).unwrap();
+            c.write_all(&answer).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let mut out = Vec::new();
+        let mut seen = Vec::new();
+        let started = Instant::now();
+        let got = download(addr, "cam", "/DO1230214.JPG", 1 << 20, &mut out, &mut |g, l| seen.push((g, l))).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(400), "didn't wait for a close");
+        assert_eq!(got, Some(body.len() as u64));
+        assert_eq!(out, body);
+        assert_eq!(seen.last(), Some(&(body.len() as u64, Some(body.len() as u64))), "the size from X-FILE_SIZE");
+        t.join().unwrap();
+
+        let (addr, _t) = serve_once(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc".to_vec());
+        assert!(download(addr, "cam", "/x", 100, &mut Vec::new(), &mut |_, _| {}).unwrap_err().contains("inside a chunk"));
+        let (addr, _t) = serve_once(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n".to_vec());
+        assert!(download(addr, "cam", "/x", 100, &mut Vec::new(), &mut |_, _| {}).unwrap_err().contains("hex"));
+        let (addr, _t) = serve_once(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffff\r\n".to_vec());
+        assert!(download(addr, "cam", "/x", 100, &mut Vec::new(), &mut |_, _| {}).unwrap_err().contains("larger"));
+    }
+
+    #[test]
+    fn downloads_refuse_missing_short_and_huge() {
+        let (addr, _t) = serve_once(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec());
+        assert_eq!(download(addr, "cam", "/x", 100, &mut Vec::new(), &mut |_, _| {}), Ok(None));
+        let (addr, _t) = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc".to_vec());
+        assert!(download(addr, "cam", "/x", 100, &mut Vec::new(), &mut |_, _| {}).unwrap_err().contains("stopped at"));
+        let (addr, _t) = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nabc".to_vec());
+        assert!(download(addr, "cam", "/x", 100, &mut Vec::new(), &mut |_, _| {}).unwrap_err().contains("larger"));
+        let (addr, _t) = serve_once(b"HTTP/1.1 200 OK\r\n\r\n0123456789".to_vec());
+        assert!(download(addr, "cam", "/x", 5, &mut Vec::new(), &mut |_, _| {}).unwrap_err().contains("larger"), "no length: capped as it comes");
+    }
+
+    #[test]
+    fn posts_soap() {
+        let (addr, t) = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec());
+        let r = http_post(addr, "cam:60606", "/Server0/CDS_control", "\"urn:x#Browse\"", "<b/>").unwrap();
+        assert_eq!(r.body, b"ok");
+        let req = t.join().unwrap();
+        assert!(req.starts_with("POST /Server0/CDS_control HTTP/1.1\r\n"));
+        assert!(req.contains("SOAPACTION: \"urn:x#Browse\"\r\n"));
+        assert!(req.contains("Content-Length: 4\r\n"));
+        assert!(req.ends_with("\r\n\r\n<b/>"));
     }
 
     #[test]

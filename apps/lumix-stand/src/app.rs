@@ -10,11 +10,12 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Key, Modifiers, RichText, TextureHandle, TextureOptions, Ui, vec2};
-use lumix_link::{CaptureOutcome, Phase};
+use lumix_link::menu::{self, Group, Kind, Setting};
+use lumix_link::{CameraSettings, CaptureOutcome, FocusStep, Phase, apex};
 
 use crate::frames;
 use crate::settings::Settings;
-use crate::worker::{SIM_ADDRESS, Status, Target, Worker};
+use crate::worker::{Download, SIM_ADDRESS, Status, Target, Worker};
 
 /// The longest a capture waits for the camera to say it fired.
 pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,8 +23,10 @@ pub const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const FIND_MS: u64 = 1500;
 /// How long closing waits for the camera's last `stopstream`.
 const CLOSE_WAIT: Duration = Duration::from_millis(500);
+/// The longest a full-size download may take, finding the photo included.
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// The controls' width.
-const SIDE_W: f32 = 330.0;
+const SIDE_W: f32 = 370.0;
 
 /// Shows the folder picker; `None`: cancelled.
 pub type Picker = Box<dyn FnMut() -> Option<PathBuf>>;
@@ -37,6 +40,26 @@ struct Pending {
     deadline: Instant,
 }
 
+/// A full-size photo on its way to the capture folder, under its reserved number.
+pub struct Fetching {
+    ticket: u64,
+    folder: PathBuf,
+    prefix: String,
+    n: u32,
+    path: PathBuf,
+    /// The live-view frame from the shutter, saved instead if the download fails.
+    fallback: Option<Arc<Vec<u8>>>,
+    deadline: Instant,
+    /// The last state seen.
+    pub state: Download,
+}
+
+impl Fetching {
+    pub fn name(&self) -> String {
+        frames::file_name(&self.prefix, self.n)
+    }
+}
+
 /// The app's state and actions (no drawing).
 pub struct Stand {
     pub settings: Settings,
@@ -48,6 +71,8 @@ pub struct Stand {
     pub prefix: String,
     worker: Option<Worker>,
     pending: Option<Pending>,
+    /// Full-size downloads under way, oldest first.
+    pub fetching: Vec<Fetching>,
     /// The last capture's result (or an error), for the window: (ok, message).
     pub last: Option<(bool, String)>,
     /// What Find found: (address, label).
@@ -67,6 +92,7 @@ impl Stand {
             settings_path,
             worker: None,
             pending: None,
+            fetching: Vec::new(),
             last: None,
             found: Vec::new(),
             finding: None,
@@ -115,6 +141,12 @@ impl Stand {
             Ok(t) => t,
             Err(e) => return self.fail(format!("{e}. Type the camera's IP address (on its own Wi-Fi, 192.168.54.1) or \u{201c}sim\u{201d}.")),
         };
+        self.connect_to(target, &address);
+    }
+
+    /// Connect to `target`, shown as `address`.
+    pub fn connect_to(&mut self, target: Target, address: &str) {
+        let address = address.to_string();
         self.disconnect();
         match Worker::start(target, &address, &self.settings.device_id, self.repaint.clone()) {
             Ok(w) => self.worker = Some(w),
@@ -127,13 +159,68 @@ impl Stand {
         }
     }
 
-    /// Close the link (the camera is asked to stop streaming).
+    /// Close the link (the camera is asked to stop streaming). Downloads under way stop, and
+    /// their live-view frames are saved instead.
     pub fn disconnect(&mut self) {
         if self.pending.take().is_some() {
             self.fail("Disconnected before the camera confirmed the capture; nothing was saved.");
         }
         if let Some(w) = self.worker.take() {
             w.close(CLOSE_WAIT);
+        }
+        self.abandon_downloads("the camera was disconnected");
+    }
+
+    /// Change a camera setting.
+    pub fn set_camera(&mut self, key: &str, value: &str) {
+        let r = self.worker.as_ref().map_or_else(|| Err("the camera isn't connected".to_string()), |w| w.set(key, value));
+        if let Err(e) = r {
+            self.fail(capitalized(&e));
+        }
+    }
+
+    /// The most pixels the camera takes: the whole sensor (4:3) at its largest size, with a fine
+    /// JPEG beside any RAW (a RAW-only photo has no JPEG to download).
+    pub fn largest_size(&mut self) {
+        let quality = self.status().and_then(|s| s.snap.settings.value("quality").map(str::to_string));
+        self.set_camera("aspectratio", "4:3");
+        self.set_camera("pictsize", menu::largest_size("4:3"));
+        let better = match quality.as_deref() {
+            Some("standard") => Some("fine"),
+            Some("raw" | "raw_standard") => Some("raw_fine"),
+            _ => None,
+        };
+        if let Some(q) = better {
+            self.set_camera("quality", q);
+        }
+    }
+
+    pub fn focus(&mut self, step: FocusStep) {
+        let r = self.worker.as_ref().map_or_else(|| Err("the camera isn't connected".to_string()), |w| w.focus(step));
+        if let Err(e) = r {
+            self.fail(capitalized(&e));
+        }
+    }
+
+    pub fn one_shot_af(&mut self) {
+        let r = self.worker.as_ref().map_or_else(|| Err("the camera isn't connected".to_string()), Worker::one_shot_af);
+        if let Err(e) = r {
+            self.fail(capitalized(&e));
+        }
+    }
+
+    /// Read every camera setting again.
+    pub fn refresh_camera(&mut self) {
+        if let Some(Err(e)) = self.worker.as_ref().map(Worker::refresh) {
+            self.fail(capitalized(&e));
+        }
+    }
+
+    /// Save full size (`true`) or the live-view frame.
+    pub fn set_full_size(&mut self, on: bool) {
+        if self.settings.full_size != on {
+            self.settings.full_size = on;
+            self.save_settings();
         }
     }
 
@@ -227,9 +314,80 @@ impl Stand {
             return name.clone();
         }
         let prefix = self.prefix_in_use().to_string();
-        let name = self.settings.folder.as_ref().and_then(|f| frames::next_number(f, &prefix).ok()).map(|n| frames::file_name(&prefix, n));
+        let name = self.settings.folder.clone().and_then(|f| self.free_number(&f, &prefix).ok()).map(|n| frames::file_name(&prefix, n));
         self.next_file = Some((Instant::now(), name.clone()));
         name
+    }
+
+    /// The next frame number in `folder`, past the ones reserved for downloads under way.
+    fn free_number(&self, folder: &std::path::Path, prefix: &str) -> Result<u32, String> {
+        let on_disk = frames::next_number(folder, prefix)?;
+        let reserved = self.fetching.iter().filter(|f| f.folder == folder && f.prefix == prefix).map(|f| f.n + 1).max().unwrap_or(0);
+        Ok(on_disk.max(reserved))
+    }
+
+    /// The shutter fired: reserve the next number and download the photo into it.
+    fn start_download(&mut self, p: Pending) -> (bool, String) {
+        let n = match self.free_number(&p.folder, &p.prefix) {
+            Ok(n) => n,
+            Err(e) => return (false, format!("The shutter fired, but the frame wasn't saved: {e}")),
+        };
+        let path = p.folder.join(frames::file_name(&p.prefix, n));
+        let started = self.worker.as_ref().map_or_else(|| Err("the camera isn't connected".to_string()), |w| w.download(p.ticket, path.clone()));
+        let f = Fetching {
+            ticket: p.ticket,
+            folder: p.folder,
+            prefix: p.prefix,
+            n,
+            path,
+            fallback: p.jpeg,
+            deadline: Instant::now() + DOWNLOAD_TIMEOUT,
+            state: Download::Waiting,
+        };
+        let name = f.name();
+        if let Err(e) = started {
+            return finish_download(&f, Err(e));
+        }
+        self.fetching.push(f);
+        (true, format!("Shutter fired; downloading the full-size photo as {name}\u{2026}"))
+    }
+
+    /// Follow the downloads; a finished one becomes the last message.
+    fn poll_downloads(&mut self) {
+        let mut done = Vec::new();
+        for (i, f) in self.fetching.iter_mut().enumerate() {
+            let state = self.worker.as_ref().map_or(Some(Download::Failed("the camera was disconnected".into())), |w| w.download_state(f.ticket));
+            let state = match state {
+                Some(Download::Done { .. } | Download::Failed(_)) => state,
+                _ if Instant::now() >= f.deadline => Some(Download::Failed(format!("it took longer than {} s", DOWNLOAD_TIMEOUT.as_secs()))),
+                None => Some(Download::Failed("the download was lost".into())),
+                s => s,
+            };
+            if let Some(s) = state {
+                f.state = s;
+            }
+            if matches!(f.state, Download::Done { .. } | Download::Failed(_)) {
+                done.push(i);
+            }
+        }
+        for i in done.into_iter().rev() {
+            let f = self.fetching.remove(i);
+            let outcome = match &f.state {
+                Download::Done { bytes, .. } => Ok(*bytes),
+                Download::Failed(e) => Err(e.clone()),
+                _ => Err("unfinished".into()),
+            };
+            self.last = Some(finish_download(&f, outcome));
+            self.next_file = None;
+        }
+    }
+
+    /// Stop following the downloads, saving their live-view frames instead.
+    fn abandon_downloads(&mut self, why: &str) {
+        for f in std::mem::take(&mut self.fetching) {
+            self.last = Some(finish_download(&f, Err(why.to_string())));
+        }
+        self.next_file = None;
     }
 
     /// Capture: the folder picker first when no folder is chosen, then the shutter; the frame is
@@ -265,11 +423,19 @@ impl Stand {
         }
     }
 
-    /// Follow up on what's under way (a capture, a search). Called on every repaint.
+    /// Follow up on what's under way (a capture, downloads, a search). Called on every repaint.
     pub fn tick(&mut self) {
         self.poll_find();
+        self.poll_downloads();
         let Some(p) = &self.pending else { return };
         let outcome = self.worker.as_ref().map_or(CaptureOutcome::Failed("the camera was disconnected".into()), |w| w.capture_outcome(p.ticket));
+        if outcome == CaptureOutcome::Done && self.settings.full_size {
+            if let Some(p) = self.pending.take() {
+                self.last = Some(self.start_download(p));
+                self.next_file = None;
+            }
+            return;
+        }
         let result = match outcome {
             CaptureOutcome::Pending if Instant::now() < p.deadline => return,
             CaptureOutcome::Pending => {
@@ -289,10 +455,42 @@ impl Stand {
         self.last = Some(result);
     }
 
-    /// The app is closing.
+    /// The app is closing: downloads under way stop, and their live-view frames are saved.
     pub fn shutdown(&mut self) {
         if let Some(w) = self.worker.take() {
             w.close(CLOSE_WAIT);
+        }
+        self.abandon_downloads("the app was closed");
+    }
+}
+
+/// A download's end in the folder: the photo is there, or the live-view frame is saved in its
+/// place so the sequence has no gap.
+fn finish_download(f: &Fetching, outcome: Result<u64, String>) -> (bool, String) {
+    let name = f.name();
+    match outcome {
+        Ok(bytes) => (true, format!("Saved {name} (full size, {:.1} MB)", bytes as f64 / 1_000_000.0)),
+        Err(why) => {
+            let why = why.trim_end_matches('.').to_string();
+            match &f.fallback {
+                Some(jpeg) => match frames::save_new(&f.path, jpeg) {
+                    Ok(()) => (
+                        false,
+                        format!(
+                            "{name}: the full-size photo wasn't downloaded ({why}); the live-view frame was saved instead. The photo is on the camera's card."
+                        ),
+                    ),
+                    Err(e) => {
+                        (false, format!("{name}: the full-size photo wasn't downloaded ({why}), and the live-view frame wasn't saved either: {e}"))
+                    }
+                },
+                None => (
+                    false,
+                    format!(
+                        "{name}: the full-size photo wasn't downloaded ({why}); nothing was saved (live view was off). The photo is on the camera's card."
+                    ),
+                ),
+            }
         }
     }
 }
@@ -351,11 +549,12 @@ impl StandApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         self.update_texture(&ctx);
-        egui::Panel::right("controls")
-            .exact_size(SIDE_W)
-            .resizable(false)
-            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(16))
-            .show(ui, |ui| controls(ui, &mut self.stand, status.as_ref()));
+        egui::Panel::right("controls").exact_size(SIDE_W).resizable(false).frame(egui::Frame::side_top_panel(ui.style()).inner_margin(16)).show(
+            ui,
+            |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| controls(ui, &mut self.stand, status.as_ref()));
+            },
+        );
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_gray(14)).inner_margin(12)).show(ui, |ui| {
             live_view(ui, self.texture.as_ref(), status.as_ref());
         });
@@ -398,6 +597,13 @@ impl StandApp {
         if let Some((path, at)) = &s.screenshot {
             match &s.shot {
                 None if t >= *at => {
+                    // For whoever runs the script: what the window says, and the link's log.
+                    if let Some((ok, m)) = &self.stand.last {
+                        eprintln!("lumix-stand: last message ({}): {m}", if *ok { "ok" } else { "problem" });
+                    }
+                    for l in self.stand.status().map(|s| s.snap.log).unwrap_or_default() {
+                        eprintln!("lumix-stand: log: {l}");
+                    }
                     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let (d, path, c) = (done.clone(), path.clone(), ctx.clone());
                     ctx.request_screenshot(move |img| {
@@ -571,6 +777,9 @@ fn controls(ui: &mut Ui, stand: &mut Stand, status: Option<&Status>) {
             stand.live_view(!live);
         }
     }
+    if let Some(s) = status.filter(|s| s.open()) {
+        camera_settings(ui, stand, s);
+    }
 
     section(ui, "CAPTURES");
     ui.horizontal(|ui| {
@@ -597,6 +806,29 @@ fn controls(ui: &mut Ui, stand: &mut Stand, status: Option<&Status>) {
         None if stand.settings.folder.is_none() => note(ui, "The first Capture asks for a folder."),
         None => note(ui, "Next: \u{2014}"),
     }
+    let mut full = stand.settings.full_size;
+    if ui.checkbox(&mut full, "Full size from the camera's card").changed() {
+        stand.set_full_size(full);
+    }
+    note(
+        ui,
+        if full {
+            "Each photo downloads in the background, 10\u{2013}20 s over the camera's Wi-Fi, while you keep shooting."
+        } else {
+            "Saves the live-view frame (640\u{d7}360) at once."
+        },
+    );
+    for f in &stand.fetching {
+        let what = match &f.state {
+            Download::Waiting => "waiting for the card".to_string(),
+            Download::Finding(p) => format!("looking for {}", p.file_name()),
+            Download::Downloading { got, total: Some(t), .. } => format!("{:.1} of {:.1} MB", *got as f64 / 1e6, *t as f64 / 1e6),
+            Download::Downloading { got, .. } => format!("{:.1} MB", *got as f64 / 1e6),
+            Download::Done { .. } => "done".into(),
+            Download::Failed(e) => e.clone(),
+        };
+        note(ui, format!("\u{2193} {}: {what}", f.name()));
+    }
 
     ui.add_space(12.0);
     let ready = status.is_some_and(Status::ready) && !stand.capturing();
@@ -611,6 +843,141 @@ fn controls(ui: &mut Ui, stand: &mut Stand, status: Option<&Status>) {
         ui.add_space(4.0);
         wrapped(ui, msg.clone(), if *ok { GOOD } else { WARN });
     }
+}
+
+/// The camera's settings, by group.
+fn camera_settings(ui: &mut Ui, stand: &mut Stand, status: &Status) {
+    let cs = status.snap.settings.clone();
+    let ready = status.ready();
+    section(ui, "CAMERA SETTINGS");
+    if !ready {
+        note(ui, "They can be changed once the camera is connected.");
+    } else if cs.values.is_empty() {
+        note(ui, "Reading the camera's settings\u{2026}");
+    }
+    let catalogue = menu::catalogue();
+    for group in Group::ALL {
+        egui::CollapsingHeader::new(group.title()).id_salt(group.title()).default_open(matches!(group, Group::Exposure | Group::Image)).show(ui, |ui| {
+            for setting in catalogue.iter().filter(|s| s.group == group) {
+                setting_row(ui, stand, setting, &cs, ready);
+            }
+            match group {
+                Group::Focus => focus_row(ui, stand, &cs, ready),
+                Group::Image => {
+                    let largest = cs.value("aspectratio") == Some("4:3") && cs.value("pictsize") == Some(menu::largest_size("4:3"));
+                    let label = if largest { "Largest size \u{2713}" } else { "Largest size" };
+                    if ui.add_enabled(ready && !largest, egui::Button::new(label)).on_hover_text("4:3 and 16M: the whole sensor, 4592\u{d7}3448. A standard or RAW-only quality becomes fine (a RAW file can't be downloaded; its JPEG can).").clicked() {
+                        stand.largest_size();
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+    if let Some(l) = cs.lens {
+        let mut lens = format!("Lens: {} to {}", apex::aperture_label(l.av_wide), apex::aperture_label(l.av_narrow));
+        if let Some(f) = l.focal_label() {
+            lens = format!("{lens}, {f}");
+        }
+        note(ui, lens);
+    }
+    if let Some(why) = refusal(&cs) {
+        wrapped(ui, why, WARN);
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(ready, egui::Button::new("Read again").small())
+            .on_hover_text("Settings changed on the camera are also read every 30 s.")
+            .clicked()
+        {
+            stand.refresh_camera();
+        }
+        if status.snap.commands_pending > 0 {
+            note(ui, "Talking to the camera\u{2026}");
+        }
+    });
+}
+
+/// One setting as a drop-down (choices the camera doesn't allow now are greyed).
+fn setting_row(ui: &mut Ui, stand: &mut Stand, setting: &Setting, cs: &CameraSettings, ready: bool) {
+    let current = cs.value(setting.key);
+    let shown = current.map_or_else(|| "\u{2014}".to_string(), |v| setting.value_label(v));
+    let mut chosen = None;
+    ui.horizontal(|ui| {
+        ui.add_sized([112.0, 20.0], egui::Label::new(setting.label).truncate());
+        ui.add_enabled_ui(ready && current.is_some(), |ui| {
+            egui::ComboBox::from_id_salt(setting.key).width(190.0).height(320.0).selected_text(shown).show_ui(ui, |ui| {
+                for (value, label, allowed) in options(setting, cs) {
+                    let on = current == Some(value.as_str());
+                    if ui.add_enabled(allowed, egui::Button::selectable(on, label)).clicked() && !on {
+                        chosen = Some(value);
+                    }
+                }
+            });
+        });
+    });
+    if let Some(v) = chosen {
+        stand.set_camera(setting.key, &v);
+    }
+}
+
+/// A setting's choices: (value, label, allowed now).
+fn options(setting: &Setting, cs: &CameraSettings) -> Vec<(String, String, bool)> {
+    let lens = cs.lens.unwrap_or_default();
+    match &setting.kind {
+        Kind::Shutter => {
+            apex::shutter_stops(lens.tv_slow, lens.tv_fast).into_iter().map(|v| (apex::format(v), apex::shutter_label(v), true)).collect()
+        }
+        Kind::Aperture => {
+            apex::aperture_stops(lens.av_wide, lens.av_narrow).into_iter().map(|v| (apex::format(v), apex::aperture_label(v), true)).collect()
+        }
+        Kind::Menu(choices) => choices.iter().map(|c| (c.value.clone(), c.label.clone(), cs.enabled(&c.menu_id))).collect(),
+    }
+}
+
+/// Focus steps and AF once, in MF.
+fn focus_row(ui: &mut Ui, stand: &mut Stand, cs: &CameraSettings, ready: bool) {
+    let mf = cs.value("focusmode") == Some("mf");
+    if !mf {
+        note(ui, "Set Focus mode to MF to focus from here.");
+        return;
+    }
+    ui.horizontal(|ui| {
+        let steps = [
+            ("\u{25c0}\u{25c0}", FocusStep::TeleFast, "A big step toward tele"),
+            ("\u{25c0}", FocusStep::Tele, "A small step toward tele"),
+            ("\u{25b6}", FocusStep::Wide, "A small step toward wide"),
+            ("\u{25b6}\u{25b6}", FocusStep::WideFast, "A big step toward wide"),
+        ];
+        for (label, step, hover) in steps {
+            if ui.add_enabled(ready, egui::Button::new(label)).on_hover_text(hover).clicked() {
+                stand.focus(step);
+            }
+        }
+        if ui.add_enabled(ready, egui::Button::new("AF once")).on_hover_text("Focus automatically once, then stay in MF.").clicked() {
+            stand.one_shot_af();
+        }
+    });
+    if let Some((pos, max)) = cs.focus {
+        ui.add(egui::ProgressBar::new(pos as f32 / max.max(1) as f32).text(format!("focus {pos} of {max}")).desired_height(14.0));
+    }
+}
+
+/// The camera's last refusal, in plain words.
+fn refusal(cs: &CameraSettings) -> Option<String> {
+    let (key, value, result) = cs.refused.as_ref()?;
+    let what = match key.as_str() {
+        "focus" => "The focus step".to_string(),
+        "oneshot_af" => "AF once".to_string(),
+        k => menu::find(k).map_or_else(|| k.to_string(), |s| format!("{} {}", s.label, s.value_label(value))),
+    };
+    let why = match result.as_str() {
+        "err_reject" => "the camera won't take it in its present state (check the mode dial)".to_string(),
+        "err_param" => "the camera doesn't take that value".to_string(),
+        "err_busy" => "the camera is busy".to_string(),
+        other => format!("the camera answered {other}"),
+    };
+    Some(format!("{what}: {why}."))
 }
 
 #[cfg(test)]
@@ -635,15 +1002,147 @@ mod tests {
         panic!("the simulated camera didn't stream: {:?}", s.status());
     }
 
-    fn finish_capture(s: &mut Stand) {
+    /// Connected to a simulated camera changed by `f`.
+    fn connect_sim_with(s: &mut Stand, f: impl FnOnce(&mut lumix_link::sim::SimOptions)) {
+        let mut o = crate::worker::sim_options();
+        f(&mut o);
+        s.connect_to(Target::Sim(o), "sim");
         for _ in 0..400 {
-            s.tick();
-            if !s.capturing() {
+            if s.status().is_some_and(|st| st.snap.phase == Phase::Streaming && st.snap.frame_seq > 1 && st.snap.photos.generation > 0) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("the capture never finished");
+        panic!("the simulated camera didn't stream: {:?}", s.status());
+    }
+
+    /// Until the shutter is confirmed and every download has ended.
+    fn finish_capture(s: &mut Stand) {
+        for _ in 0..800 {
+            s.tick();
+            if !s.capturing() && s.fetching.is_empty() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the capture never finished: {:?}", s.last);
+    }
+
+    fn size_of(path: &std::path::Path) -> (u32, u32) {
+        let f = crate::worker::decode(1, &std::fs::read(path).unwrap()).unwrap();
+        (f.width, f.height)
+    }
+
+    fn saved_full(last: &Option<(bool, String)>, name: &str) -> bool {
+        last.as_ref().is_some_and(|(ok, m)| *ok && m.starts_with(&format!("Saved {name} (full size, ")))
+    }
+
+    #[test]
+    fn saves_the_full_size_photo_from_the_card() {
+        let d = TempDir::new("app-full");
+        let mut s = stand(Some(d.0.clone()), None, None);
+        connect_sim(&mut s);
+        s.capture();
+        finish_capture(&mut s);
+        assert!(saved_full(&s.last, "frame_0001.jpg"), "{:?}", s.last);
+        assert_eq!(size_of(&d.0.join("frame_0001.jpg")), (1920, 1080), "the original, not live view");
+        assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 1, "no .part file left");
+    }
+
+    #[test]
+    fn captures_keep_coming_while_photos_download() {
+        let d = TempDir::new("app-queue");
+        let mut s = stand(Some(d.0.clone()), None, None);
+        connect_sim_with(&mut s, |o| o.original_delay_ms = 1_500);
+        for _ in 0..3 {
+            s.capture();
+            for _ in 0..200 {
+                s.tick();
+                if !s.capturing() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let names: Vec<String> = s.fetching.iter().map(Fetching::name).collect();
+        assert_eq!(names, ["frame_0001.jpg", "frame_0002.jpg", "frame_0003.jpg"], "each its own number");
+        assert_eq!(s.next_file().as_deref(), Some("frame_0004.jpg"), "past the reserved ones");
+        finish_capture(&mut s);
+        for n in 1..=3 {
+            assert_eq!(size_of(&d.0.join(frames::file_name("frame", n))), (1920, 1080));
+        }
+    }
+
+    #[test]
+    fn a_download_cut_short_saves_the_live_view_frame() {
+        let d = TempDir::new("app-cut");
+        let mut s = stand(Some(d.0.clone()), None, None);
+        connect_sim_with(&mut s, |o| o.original_delay_ms = 60_000);
+        s.capture();
+        for _ in 0..200 {
+            s.tick();
+            if !s.fetching.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(s.fetching.len(), 1);
+        s.disconnect();
+        assert!(s.last.as_ref().is_some_and(|(ok, m)| !ok && m.contains("live-view frame was saved instead")), "{:?}", s.last);
+        assert_eq!(size_of(&d.0.join("frame_0001.jpg")), (640, 360));
+    }
+
+    #[test]
+    fn live_view_frames_when_full_size_is_off() {
+        let d = TempDir::new("app-lv");
+        let mut s = stand(Some(d.0.clone()), None, None);
+        s.set_full_size(false);
+        connect_sim(&mut s);
+        s.capture();
+        finish_capture(&mut s);
+        assert_eq!(s.last, Some((true, "Saved frame_0001.jpg".into())));
+        assert_eq!(size_of(&d.0.join("frame_0001.jpg")), (640, 360));
+    }
+
+    #[test]
+    fn changes_camera_settings() {
+        let mut s = stand(None, None, None);
+        connect_sim(&mut s);
+        let value = |s: &Stand, k: &str| s.status().and_then(|st| st.snap.settings.value(k).map(str::to_string));
+        for _ in 0..300 {
+            if value(&s, "pictsize").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(value(&s, "aspectratio").as_deref(), Some("16:9"));
+        s.set_camera("iso", "800");
+        s.largest_size();
+        s.set_camera("focusmode", "mf");
+        s.focus(FocusStep::Wide);
+        for _ in 0..300 {
+            if value(&s, "pictsize").as_deref() == Some("16m")
+                && value(&s, "iso").as_deref() == Some("800")
+                && s.status().is_some_and(|st| st.snap.settings.focus.is_some())
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let st = s.status().unwrap();
+        assert_eq!((value(&s, "aspectratio").as_deref(), value(&s, "pictsize").as_deref()), (Some("4:3"), Some("16m")));
+        assert_eq!(value(&s, "iso").as_deref(), Some("800"));
+        assert_eq!(st.snap.settings.focus, Some((526, 1024)));
+        assert_eq!(refusal(&st.snap.settings), None);
+        s.set_camera("iso", "77");
+        for _ in 0..300 {
+            if s.status().is_some_and(|st| st.snap.settings.refused.is_some()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(refusal(&s.status().unwrap().snap.settings).as_deref(), Some("ISO 77: the camera doesn't take that value."));
+        s.shutdown();
     }
 
     #[test]
@@ -654,7 +1153,7 @@ mod tests {
         assert_eq!(s.next_file().as_deref(), Some("frame_0001.jpg"));
         s.capture();
         finish_capture(&mut s);
-        assert_eq!(s.last, Some((true, "Saved frame_0001.jpg".into())));
+        assert!(saved_full(&s.last, "frame_0001.jpg"), "{:?}", s.last);
         let saved = std::fs::read(d.0.join("frame_0001.jpg")).unwrap();
         assert!(crate::worker::decode(1, &saved).is_some(), "a real JPEG");
         s.prefix = "take".into();
@@ -692,6 +1191,7 @@ mod tests {
     fn live_view_off_fires_but_saves_nothing() {
         let d = TempDir::new("app-off");
         let mut s = stand(Some(d.0.clone()), None, None);
+        s.set_full_size(false);
         connect_sim(&mut s);
         s.live_view(false);
         for _ in 0..400 {
@@ -704,6 +1204,12 @@ mod tests {
         finish_capture(&mut s);
         assert!(matches!(&s.last, Some((false, m)) if m.contains("live view is off")), "{:?}", s.last);
         assert_eq!(std::fs::read_dir(&d.0).unwrap().count(), 0);
+
+        // At full size, live view doesn't matter.
+        s.set_full_size(true);
+        s.capture();
+        finish_capture(&mut s);
+        assert!(saved_full(&s.last, "frame_0001.jpg"), "{:?}", s.last);
     }
 
     #[test]

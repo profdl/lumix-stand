@@ -7,10 +7,15 @@ animation-stand camera. Moved out of Picabia (`../vectorcraft/picabia-vector`, P
 - `crates/lumix` (`lumix-link`): the camera protocol, with no dependencies. A sans-IO `Controller`
   (handshake and the wait for the camera to accept a new computer, record mode, live view,
   keep-alive, reconnect with backoff, capture). Also `frame` (the JPEG in a datagram), `reply`
-  (`cam.cgi` XML and the plain-text `accctrl` answer), `sim` (a simulated camera behind the same
-  `Transport`), `ssdp`, `net` (std::net: HTTP GET, the UDP socket, discovery), and
-  `examples/probe/main.rs`.
-- `apps/lumix-stand`: the eframe app. `worker` (the link's thread, frame decoding), `frames`
+  (`cam.cgi` XML and the plain-text `accctrl` answer), `menu` (every setting, from the camera's
+  `allmenu`, and `curmenu`'s enable flags), `apex` (shutter and aperture as `n/256`, the lens's
+  ranges), `photos` (DLNA listing, the next photo's number), `xml` (a small tag reader), `sim` (a
+  simulated camera behind the same `Transport`, settings and card included), `ssdp`, `net`
+  (std::net: HTTP GET and SOAP POST, streaming chunked downloads, the UDP socket, discovery), and
+  `examples/probe/main.rs`. The `Controller` also queues setting and focus `Command`s between the
+  periodic requests and lists the card at connect.
+- `apps/lumix-stand`: the eframe app. `worker` (the link's thread, frame decoding, and a second
+  thread downloading full-size originals, so live view keeps going), `frames`
   (numbered `<prefix>_<NNNN>.jpg`, never overwriting), `settings` (JSON in the OS config folder),
   `app` (`Stand`: state and actions, tested headless against `sim`; `StandApp`: the window).
   `cargo run -p lumix-stand -- --connect sim` tries it without a camera; `--settings FILE`,
@@ -46,8 +51,8 @@ animation-stand camera. Moved out of Picabia (`../vectorcraft/picabia-vector`, P
   `MediaRenderer` (the phone app) and opens no ports until something answers. See `docs/gx85.md`.
 
 ## Next steps
-1. Check the app with the real camera.
+1. Live view that shows the exposure: turn on Constant Preview on the camera (M mode) and measure
+   again (docs/gx85.md ▸ Live view and the settings).
 2. Optional: send each capture to a running Picabia through its control port (`file.place` with
    `link: true`).
-3. Later: full-resolution download over DLNA (port 60606), lock focus and exposure (`setsetting`),
-   and Via Network mode.
+3. Later: Via Network mode; white balance by colour temperature (`color_temp`'s value form).

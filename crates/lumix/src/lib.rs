@@ -7,6 +7,9 @@
 //! everything that is still a guess is marked *hypothesis* where it is used.
 //!
 //! # Parts
+//! - [`apex`]: shutter speed and aperture in the camera's units, and the lens's ranges.
+//! - [`menu`]: every setting the app can change, its choices, and which the camera allows now.
+//! - [`photos`]: the card's photos at full size (listing with DLNA, the next photo's number).
 //! - [`frame`]: the JPEG in a live-view datagram (the datagrams are untrusted: sizes capped, nothing
 //!   indexes unchecked).
 //! - [`reply`]: a `cam.cgi` XML reply read leniently ([`Reply`]).
@@ -23,22 +26,27 @@
 //! - `net` (native only): the real transport over `std::net`, and SSDP discovery.
 #![forbid(unsafe_code)]
 
+pub mod apex;
 mod controller;
 pub mod frame;
+pub mod menu;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod net;
+pub mod photos;
 pub mod reply;
 pub mod sim;
 pub mod ssdp;
 mod transport;
+pub mod xml;
 
 #[cfg(test)]
 mod controller_tests;
 
-pub use controller::{CaptureOutcome, Controller, Options, Phase, Snapshot};
+pub use controller::{CameraSettings, CaptureOutcome, Command, Controller, FocusStep, Options, Phase, PhotoIndex, Snapshot};
 pub use frame::{Frame, FrameError, extract_jpeg};
+pub use photos::PhotoId;
 pub use reply::Reply;
-pub use transport::{HttpReply, Request, RequestKind, Transport, pump};
+pub use transport::{HttpReply, Originals, Post, Request, RequestKind, Transport, pump};
 
 /// The camera's address on its own Wi-Fi network.
 pub const DEFAULT_IP: &str = "192.168.54.1";
