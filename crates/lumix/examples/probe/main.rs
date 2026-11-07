@@ -4,6 +4,7 @@
 //! ```text
 //! cargo run -p lumix-link --example probe -- [--ip 192.168.54.1] [--port 49199] [--out DIR]
 //!     [--frames 10] [--seconds 6] [--handshake] [--no-capture] [--no-measure-timeout] [--discover]
+//!     [--settings [--no-set] [--try-focus]]
 //! ```
 //!
 //! Without `--ip` it searches the network first (SSDP) and uses the camera it finds, else
@@ -18,6 +19,15 @@
 //! JPEGs, the time between frames), (`--measure-timeout`: how long the stream lasts with no
 //! further command), (`--capture`: fire the shutter), `stopstream`. Everything goes to the terminal
 //! and to `DIR/probe.log`.
+//!
+//! `--settings` explores the camera's settings instead of live view: after `recmode` it saves the
+//! `getinfo` answers (`DIR/getinfo_*.xml`), reads each setting with `getsetting`, and tries
+//! `setsetting` for shutter speed, aperture, ISO, exposure compensation, white balance and focus
+//! mode: first the current value written back unchanged, then a few guessed values in different
+//! formats. **Every change is undone at once** (the original value written back and read again),
+//! and a summary at the end says what was accepted, refused and restored. `--no-set` only reads.
+//! `--try-focus` also moves the focus one step each way (`camctrl`) and back, which can't be undone
+//! exactly: use it only when the stand's focus can be set again.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -26,6 +36,8 @@ use std::time::{Duration, Instant};
 use lumix_link::frame::{MAX_DATAGRAM, hex_dump};
 use lumix_link::net::{self, NetTransport};
 use lumix_link::{Reply, Transport, extract_jpeg};
+
+mod settings;
 
 struct Args {
     ip: String,
@@ -39,6 +51,9 @@ struct Args {
     capture: bool,
     measure_timeout: bool,
     discover: bool,
+    settings: bool,
+    no_set: bool,
+    try_focus: bool,
 }
 
 fn args() -> Result<Args, String> {
@@ -56,6 +71,9 @@ fn args() -> Result<Args, String> {
         capture: true,
         measure_timeout: true,
         discover: false,
+        settings: false,
+        no_set: false,
+        try_focus: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -75,7 +93,10 @@ fn args() -> Result<Args, String> {
             "--measure-timeout" => a.measure_timeout = true,
             "--no-measure-timeout" => a.measure_timeout = false,
             "--discover" => a.discover = true,
-            "-h" | "--help" => return Err(include_str!("probe.rs").lines().take(12).collect::<Vec<_>>().join("\n")),
+            "--settings" => a.settings = true,
+            "--no-set" => a.no_set = true,
+            "--try-focus" => a.try_focus = true,
+            "-h" | "--help" => return Err(include_str!("main.rs").lines().take(14).collect::<Vec<_>>().join("\n")),
             _ => return Err(format!("unknown option {k} (--help lists them)")),
         }
     }
@@ -126,6 +147,11 @@ fn main() -> Result<(), String> {
         wait_for_acceptance(&mut t, &mut log)?;
     }
     cmd(&mut t, &mut log, "/cam.cgi?mode=camcmd&value=recmode")?;
+    if a.settings {
+        settings::explore(&a, &mut t, &mut log);
+        log.line(&format!("done: send {} and the getinfo_*.xml files beside it", log_path.display()));
+        return Ok(());
+    }
     let start = format!("/cam.cgi?mode=startstream&value={}", t.udp_port());
     cmd(&mut t, &mut log, &start)?;
     stream(&a, &mut t, &mut log, &start);

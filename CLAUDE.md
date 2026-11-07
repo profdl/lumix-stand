@@ -9,7 +9,7 @@ animation-stand camera. Moved out of Picabia (`../vectorcraft/picabia-vector`, P
   keep-alive, reconnect with backoff, capture). Also `frame` (the JPEG in a datagram), `reply`
   (`cam.cgi` XML and the plain-text `accctrl` answer), `sim` (a simulated camera behind the same
   `Transport`), `ssdp`, `net` (std::net: HTTP GET, the UDP socket, discovery), and
-  `examples/probe.rs`.
+  `examples/probe/main.rs`.
 - `apps/lumix-stand`: the eframe app. `worker` (the link's thread, frame decoding), `frames`
   (numbered `<prefix>_<NNNN>.jpg`, never overwriting), `settings` (JSON in the OS config folder),
   `app` (`Stand`: state and actions, tested headless against `sim`; `StandApp`: the window).

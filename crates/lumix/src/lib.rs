@@ -3,7 +3,7 @@
 //! camera. See `docs/gx85.md`.
 //!
 //! The protocol is not documented by Panasonic. What this crate does comes from public community
-//! notes and is checked against a real camera with the probe (`examples/probe.rs`);
+//! notes and is checked against a real camera with the probe (`examples/probe/main.rs`);
 //! everything that is still a guess is marked *hypothesis* where it is used.
 //!
 //! # Parts
