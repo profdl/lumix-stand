@@ -537,12 +537,7 @@ fn fetch(
         if cancel.load(Ordering::SeqCst) {
             return Err("stopped".into());
         }
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&part)
-            .map_err(|e| format!("can't write {}: {e}", part.display()))?;
+        let file = new_part(&part)?;
         let mut out = Cancellable { inner: std::io::BufWriter::new(file), cancel };
         let mut last_shown = Instant::now();
         let mut progress = |got: u64, total: Option<u64>| {
@@ -577,6 +572,17 @@ fn fetch(
             }
         }
     }
+}
+
+/// A fresh, empty `part`. A file (or link) left there is removed first, and the new one is
+/// created only if nothing is there, so a link planted at that name is never followed.
+fn new_part(part: &Path) -> Result<std::fs::File, String> {
+    match std::fs::remove_file(part) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("can't replace {}: {e}", part.display())),
+    }
+    std::fs::OpenOptions::new().write(true).create_new(true).open(part).map_err(|e| format!("can't write {}: {e}", part.display()))
 }
 
 /// `<path>.part`.
@@ -789,6 +795,21 @@ mod tests {
         let shared = w.shared.clone();
         w.close(Duration::from_millis(500));
         assert!(lock(&shared).ended.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_part_name_is_never_followed() {
+        let d = crate::frames::tests::TempDir::new("part-link");
+        let victim = d.0.join("victim.txt");
+        std::fs::write(&victim, b"keep me").unwrap();
+        let part = d.0.join("frame_0001.jpg.part");
+        std::os::unix::fs::symlink(&victim, &part).unwrap();
+        let mut f = new_part(&part).unwrap();
+        std::io::Write::write_all(&mut f, b"photo").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(!std::fs::symlink_metadata(&part).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&part).unwrap(), b"photo");
     }
 
     #[test]
